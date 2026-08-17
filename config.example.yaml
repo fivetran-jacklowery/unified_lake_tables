@@ -1,0 +1,45 @@
+# Copy this file to config.yaml and edit it for your environment.
+# config.yaml (the real one, with your actual namespace names) is
+# gitignored -- it isn't secret in the way credentials are, but there's no
+# reason to commit account-specific object names either.
+
+# Namespace where the consolidated (target) tables get created. This is a
+# new namespace -- it does not need to exist yet, the script creates it.
+target_namespace: consolidated
+
+# Every source namespace to fold into the consolidated tables. These are
+# the Polaris/Iceberg namespaces your Fivetran connections land into --
+# typically one namespace per connection, one per tenant, or one per
+# customer database, depending on how your connectors are set up. List
+# every source namespace you want included; there is no limit on how many.
+#
+# All listed namespaces are expected to share the same table names and a
+# structurally compatible schema (same columns meaning the same thing).
+# This tool does not handle sources with a genuinely different shape --
+# see the README's "What this does NOT yet handle" section before running
+# it against sources you aren't sure are structurally identical.
+source_namespaces:
+  - sqlserver_tenant_001
+  - sqlserver_tenant_002
+  - sqlserver_tenant_003
+  # ... add as many source namespaces as you have
+
+# Name of the bookkeeping column added to every consolidated table. It
+# records which source namespace each row came from, and it's also the
+# identity-partition column, so filtering a query on this column is what
+# gets you real partition pruning (see docs/HOW_IT_WORKS.md).
+#
+# Pick a name that doesn't collide with any real column name already used
+# by your source tables.
+source_id_column: source_connection_id
+
+# --- Optional performance tuning below. Safe to omit; defaults shown. ---
+
+# How many target tables to register concurrently (top-level thread pool).
+# This is the dominant lever once you have more tables than sources.
+table_workers: 8
+
+# How many source namespaces to read concurrently, per table, while
+# checking for new/drifted files. This is the dominant lever once you
+# have more sources than tables.
+source_workers: 8
