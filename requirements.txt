@@ -1,0 +1,21 @@
+# Tested against pyiceberg 0.11.1. The reserved-field-id trick this tool
+# relies on (see docs/HOW_IT_WORKS.md) depends on a private, undocumented
+# pyiceberg implementation detail (an internal itertools.count attribute
+# on the schema-update builder with no public setter -- see
+# apache/iceberg-python#1284, open upstream since November 2024). That
+# means a pyiceberg upgrade could silently change this behavior with no
+# deprecation warning. Pin this exactly and re-run
+# scripts/verify_consolidation.py after any deliberate upgrade rather than
+# floating the version.
+pyiceberg[pyarrow]==0.11.1
+
+# pyiceberg[pyarrow] already pulls in a compatible pyarrow, but pin it
+# directly too since the manifest-splicing logic touches pyarrow's S3
+# filesystem and Arrow table internals fairly closely.
+pyarrow==25.0.0
+
+PyYAML==6.0.3
+
+# Loads .env into the process environment so the scripts pick up Polaris
+# OAuth credentials without requiring the customer to `export` them by hand.
+python-dotenv==1.0.1
