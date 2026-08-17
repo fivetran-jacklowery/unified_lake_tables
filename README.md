@@ -11,6 +11,11 @@ Fivetran connections are split up) into a single queryable table per table
 type, on a Fivetran-managed Polaris catalog and Managed Data Lake Service
 (MDLS) destination, without rewriting any of the underlying data.
 
+See [`docs/REFERENCE_ARCHITECTURE.md`](docs/REFERENCE_ARCHITECTURE.md) for
+the end-to-end diagram, or the
+[full slide deck](https://docs.google.com/presentation/d/1zie3Rp3qcVEms50A7C_RiJgRVx-RGG2Z4xZ9JqbWg8U/edit)
+this was pitched and explained from.
+
 ## What this does, and why
 
 If you run N connections of the same connector (say, one SQL Server

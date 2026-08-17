@@ -26,3 +26,4 @@ env/
 # Logs / local run artifacts
 *.log
 .pytest_cache/
+docs/images/.trash_slide05
