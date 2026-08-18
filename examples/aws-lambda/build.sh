@@ -9,19 +9,23 @@
 #   3. This example's pinned dependencies (requirements.txt), installed
 #      directly into the package directory
 #
-# IMPORTANT -- build on (or for) the same architecture as your Lambda
-# function. pyarrow ships compiled, platform-specific binaries. The
-# straightforward `pip install` below only produces a correct package if
-# you run this script on Linux matching your function's configured
-# architecture (arm64 is recommended -- see README.md). If you're building
-# on macOS or Windows, or want a guaranteed-correct build regardless of
-# your own machine, build inside the official Lambda base image instead:
+# IMPORTANT -- pyarrow ships compiled, platform-specific binaries, and
+# Lambda's runtime is Linux. A plain `pip install` on this same machine
+# only produces a Lambda-compatible package if this machine IS Linux
+# matching your function's architecture. On any other OS (macOS, Windows),
+# `pip install -t build` happily installs THAT OS's wheels instead --
+# the build finishes and even a local `python3 -c "import pyarrow"` sanity
+# check on that same machine passes, because it's importing a native
+# build for the machine it's running on. It will still fail the moment
+# Lambda actually invokes it. This was hit for real building this exact
+# example on a Mac, not a hypothetical.
 #
-#   docker run --rm -v "$PWD":/var/task -w /var/task \
-#     public.ecr.aws/sam/build-python3.12:latest-arm64 \
-#     pip install -r requirements.txt -t build
-#
-# then run the rest of this script's copy/trim/zip steps as-is.
+# So: this script uses Docker (the official Lambda build image) to do BOTH
+# the dependency install and the import sanity-check, whenever Docker is
+# available -- not just the install -- specifically so a passing sanity
+# check here actually means something. It only falls back to a plain host
+# `pip install` if Docker isn't available, and refuses to silently trust
+# that fallback's sanity check if the host isn't Linux.
 #
 # Usage:
 #   ./build.sh
@@ -33,12 +37,34 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 BUILD_DIR="$HERE/build"
 ZIP_PATH="$HERE/deployment.zip"
+LAMBDA_BUILD_IMAGE="public.ecr.aws/sam/build-python3.12:latest-arm64"
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
-echo "Installing dependencies into $BUILD_DIR ..."
-pip install -r "$HERE/requirements.txt" -t "$BUILD_DIR" --quiet
+SANITY_CHECK='
+import pyarrow, pyarrow.parquet, pyarrow.dataset
+import pyiceberg
+from pyiceberg.catalog.rest import RestCatalog
+from pyiceberg.manifest import DataFile, DataFileContent
+import register_consolidation
+print("OK: package imports cleanly, pyarrow", pyarrow.__version__)
+'
+
+if command -v docker >/dev/null 2>&1; then
+  echo "Docker found -- installing dependencies inside $LAMBDA_BUILD_IMAGE"
+  echo "(guarantees a Linux/arm64-correct build regardless of this machine's own OS) ..."
+  docker run --rm -v "$HERE":/var/task -w /var/task "$LAMBDA_BUILD_IMAGE" \
+    pip install -r requirements.txt -t build --quiet
+  USED_DOCKER=1
+else
+  echo "Docker not found -- falling back to a plain host 'pip install'."
+  echo "This ONLY produces a working Lambda package if this machine is"
+  echo "Linux/arm64. Installing Docker and re-running this script is strongly"
+  echo "recommended on macOS/Windows -- see this script's header comment."
+  pip install -r "$HERE/requirements.txt" -t "$BUILD_DIR" --quiet
+  USED_DOCKER=0
+fi
 
 echo "Copying handler and shared consolidation script ..."
 cp "$HERE/lambda_function.py" "$BUILD_DIR/"
@@ -71,15 +97,27 @@ else
   echo "  Trimmed: $UNTRIMMED_SIZE -> $TRIMMED_SIZE"
 fi
 
-echo "Sanity-checking the trimmed package still imports cleanly ..."
-( cd "$BUILD_DIR" && python3 -c "
-import pyarrow, pyarrow.parquet, pyarrow.dataset
-import pyiceberg
-from pyiceberg.catalog.rest import RestCatalog
-from pyiceberg.manifest import DataFile, DataFileContent
-import register_consolidation
-print('OK: trimmed package imports cleanly, pyarrow', pyarrow.__version__)
-" )
+if [ "$USED_DOCKER" = "1" ]; then
+  echo "Sanity-checking the package imports cleanly INSIDE the Lambda build image"
+  echo "(this is the check that actually matters -- a host-machine import check"
+  echo "would pass even for a mismatched-platform build, so this runs in the"
+  echo "same Linux/arm64 environment Lambda itself uses) ..."
+  docker run --rm -v "$BUILD_DIR":/var/task -w /var/task "$LAMBDA_BUILD_IMAGE" \
+    python3 -c "$SANITY_CHECK"
+else
+  HOST_OS="$(uname -s)"
+  if [ "$HOST_OS" != "Linux" ]; then
+    echo "SKIPPING sanity-check import: this machine is $HOST_OS, not Linux, and"
+    echo "Docker isn't available. A local import check here would silently pass"
+    echo "against THIS machine's own native pyarrow build and prove nothing about"
+    echo "whether the package works on Lambda's Linux runtime -- running it would"
+    echo "give false confidence, so this deliberately does not run it. Install"
+    echo "Docker and re-run this script before deploying anything built this way."
+  else
+    echo "Sanity-checking the package imports cleanly ..."
+    ( cd "$BUILD_DIR" && python3 -c "$SANITY_CHECK" )
+  fi
+fi
 
 echo "Zipping ..."
 rm -f "$ZIP_PATH"
