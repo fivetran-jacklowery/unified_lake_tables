@@ -538,27 +538,26 @@ def register_table(table_name: str, cfg: dict) -> tuple:
 # --------------------------------------------------------------------------
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="No-rewrite Iceberg table consolidation for a Fivetran-managed Polaris/MDLS catalog."
-    )
-    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml (default: ./config.yaml)")
-    parser.add_argument(
-        "tables",
-        nargs="*",
-        help="Optional: restrict to these table names instead of auto-discovering common tables",
-    )
-    args = parser.parse_args()
+def run(cfg: dict, tables: list = None) -> dict:
+    """Run one full registration pass for the given config and return a
+    JSON-serializable summary dict. This is the shared entry point behind
+    both the CLI (main(), below) and any other caller that already has a
+    cfg dict in hand -- e.g. examples/aws-lambda/lambda_function.py builds
+    cfg directly from Lambda environment variables instead of a config.yaml
+    file on disk, and calls this function directly rather than duplicating
+    the discovery/threading logic.
 
-    load_dotenv()  # loads .env into the process environment if present
-    cfg = load_config(args.config)
-
+    Raises SystemExit if there are no tables to register (mirrors main()'s
+    prior behavior); callers that want a non-fatal empty-result instead
+    should catch that themselves.
+    """
     t_run_start = time.time()
     driver_cat = get_catalog()
-    tables = args.tables or discover_common_tables(driver_cat, cfg["source_namespaces"])
+    tables = tables or discover_common_tables(driver_cat, cfg["source_namespaces"])
     if not tables:
-        logger.error("No tables to register (no table name is common to every configured source namespace).")
-        sys.exit(1)
+        raise SystemExit(
+            "No tables to register (no table name is common to every configured source namespace)."
+        )
 
     logger.info(
         "Registering %d table(s) across %d source namespace(s) into '%s', table_workers=%d, source_workers=%d",
@@ -585,21 +584,48 @@ def main():
             per_table_timing.append((table_name, elapsed))
 
     wall_clock = time.time() - t_run_start
+    slowest = sorted(per_table_timing, key=lambda x: -x[1])[:5]
+    return {
+        "tables": len(tables),
+        "sources": len(cfg["source_namespaces"]),
+        "total_spliced": grand_spliced,
+        "total_rewritten": grand_rewritten,
+        "grand_total": grand_spliced + grand_rewritten,
+        "wall_clock_seconds": round(wall_clock, 1),
+        "slowest_tables": slowest,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="No-rewrite Iceberg table consolidation for a Fivetran-managed Polaris/MDLS catalog."
+    )
+    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml (default: ./config.yaml)")
+    parser.add_argument(
+        "tables",
+        nargs="*",
+        help="Optional: restrict to these table names instead of auto-discovering common tables",
+    )
+    args = parser.parse_args()
+
+    load_dotenv()  # loads .env into the process environment if present
+    cfg = load_config(args.config)
+    summary = run(cfg, tables=args.tables or None)
+
     print("\n=== SUMMARY ===")
-    print(f"TABLES: {len(tables)}  SOURCES: {len(cfg['source_namespaces'])}")
-    print(f"TOTAL SPLICED (no-rewrite): {grand_spliced}")
-    print(f"TOTAL REWRITTEN (collision-only): {grand_rewritten}")
-    print(f"GRAND TOTAL: {grand_spliced + grand_rewritten}")
-    print(f"WALL CLOCK: {wall_clock:.1f}s")
-    if grand_rewritten > 0:
+    print(f"TABLES: {summary['tables']}  SOURCES: {summary['sources']}")
+    print(f"TOTAL SPLICED (no-rewrite): {summary['total_spliced']}")
+    print(f"TOTAL REWRITTEN (collision-only): {summary['total_rewritten']}")
+    print(f"GRAND TOTAL: {summary['grand_total']}")
+    print(f"WALL CLOCK: {summary['wall_clock_seconds']}s")
+    if summary["total_rewritten"] > 0:
         print(
-            f"\nNOTE: {grand_rewritten} row(s) went through the rewrite/collision path this run. "
+            f"\nNOTE: {summary['total_rewritten']} row(s) went through the rewrite/collision path this run. "
             "That's expected on the first run after a genuine cross-source field-id collision, but "
             "if a specific source keeps landing on this path across repeated runs, its schema is "
             "drifting more than this tool's steady-state cost model assumes -- worth a closer look."
         )
-    slowest = sorted(per_table_timing, key=lambda x: -x[1])[:5]
-    print(f"Slowest 5 tables (elapsed, includes queueing behind the thread pool): {slowest}")
+    print(f"Slowest 5 tables (elapsed, includes queueing behind the thread pool): {summary['slowest_tables']}")
 
 
 if __name__ == "__main__":

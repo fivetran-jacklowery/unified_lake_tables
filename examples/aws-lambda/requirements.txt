@@ -1,0 +1,7 @@
+# Same runtime dependencies register_consolidation.py needs on the CLI --
+# nothing Lambda-specific here. Pinned versions match the repo root
+# requirements.txt; keep these in sync if that file changes.
+pyiceberg[pyarrow]==0.11.1
+pyarrow==25.0.0
+PyYAML==6.0.3
+python-dotenv==1.0.1
