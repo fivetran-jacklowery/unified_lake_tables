@@ -14,7 +14,9 @@ type, on a Fivetran-managed Polaris catalog and Managed Data Lake Service
 See [`docs/REFERENCE_ARCHITECTURE.md`](docs/REFERENCE_ARCHITECTURE.md) for
 the end-to-end diagram, or the
 [full slide deck](https://docs.google.com/presentation/d/1zie3Rp3qcVEms50A7C_RiJgRVx-RGG2Z4xZ9JqbWg8U/edit)
-this was pitched and explained from.
+this was pitched and explained from. For a short, customer-facing explainer
+on why this beats a `UNION ALL` view or a materialized merge job, see
+[`docs/customer-one-pager.pdf`](docs/customer-one-pager.pdf).
 
 ## What this does, and why
 
