@@ -151,7 +151,7 @@ aws lambda create-function \
     POLARIS_CLIENT_SECRET=your_client_secret,
     POLARIS_TOKEN_URI=https://your-token-endpoint,
     TARGET_NAMESPACE=consolidated,
-    SOURCE_NAMESPACES=tenant_001,tenant_002,tenant_003,
+    SOURCE_NAMESPACE_PATTERN=tenant_*,
     SOURCE_ID_COLUMN=source_connection_id,
     TABLE_WORKERS=8,
     SOURCE_WORKERS=8
@@ -169,7 +169,8 @@ Environment variables this function reads (see `lambda_function.py`'s
 | `POLARIS_CLIENT_SECRET` | yes | See "Beyond this example" below before using this in anything but a first test. |
 | `POLARIS_TOKEN_URI` | recommended | Same deprecation-avoidance reason as the CLI's `.env.example`. |
 | `TARGET_NAMESPACE` | yes | |
-| `SOURCE_NAMESPACES` | yes | Comma-separated (this is the one shape difference from `config.yaml`'s YAML list). |
+| `SOURCE_NAMESPACES` | yes, unless using the pattern below | Comma-separated (this is the one shape difference from `config.yaml`'s YAML list). Fine for a handful of sources. |
+| `SOURCE_NAMESPACE_PATTERN` | yes, unless using the explicit list above | A glob (`tenant_*`, not SQL `LIKE`) resolved against the catalog's real namespaces on every run -- use this instead of `SOURCE_NAMESPACES` once you have more sources than is reasonable to hand-list, or want new tenant namespaces picked up automatically without a config change. Set exactly one of these two, not both. The resolved list is always logged -- check CloudWatch Logs after a pattern-based run's first invoke to confirm it matched what you expected. |
 | `SOURCE_ID_COLUMN` | yes | |
 | `TABLE_WORKERS` / `SOURCE_WORKERS` | no | Default to 8, same as `load_config()`'s defaults. |
 

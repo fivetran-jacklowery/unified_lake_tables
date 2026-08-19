@@ -87,9 +87,16 @@ cp config.example.yaml config.yaml
 ```
 
 Edit `config.yaml`: set `target_namespace` (a new namespace name for the
-consolidated tables — it doesn't need to exist yet), list every
-`source_namespaces` entry, and pick a `source_id_column` name that won't
-collide with a real column in any source. Leave `table_workers` /
+consolidated tables — it doesn't need to exist yet), a `source_id_column`
+name that won't collide with a real column in any source, and EITHER list
+every `source_namespaces` entry explicitly OR set `source_namespace_pattern`
+to a glob (e.g. `"tenant_*"`) if you're dealing with more sources than is
+reasonable to hand-enumerate — the pattern gets resolved against the
+catalog's real namespaces at run time (see `config.example.yaml` and
+`docs/HOW_IT_WORKS.md`'s "Choosing which sources to consolidate" section).
+If you use a pattern, always check the resolved namespace list the script
+logs before trusting a run against production data — a pattern that's too
+broad or too narrow is a real, silent failure mode. Leave `table_workers` /
 `source_workers` at their defaults unless you're consolidating at real scale
 (dozens of tables and/or sources) and want to tune concurrency — see
 `docs/HOW_IT_WORKS.md`'s parallelism section for what each one actually

@@ -49,6 +49,42 @@ unrelated bookkeeping. The result wasn't an error -- a column silently
 returned the wrong data for every affected row, with nothing anywhere
 flagging it. That's the bug this tool's correctness layer exists to prevent.
 
+## Choosing which sources to consolidate
+
+`config.yaml`'s `source_namespaces` accepts either an explicit list or a
+glob pattern (`source_namespace_pattern`, e.g. `"tenant_*"`) -- pick
+whichever fits your scale. An explicit list is fine for a handful of
+sources. At real scale (the scale this tool is actually built for --
+Ecolab-style 400+ Azure SQL databases, Andersen-style 10,000+ ERP tables),
+hand-listing every namespace defeats the point.
+
+`resolve_source_namespaces()` handles the pattern case: it calls the
+catalog's `list_namespaces()` to get every namespace that currently
+exists, then keeps whichever ones match the glob (`fnmatch` semantics --
+`*`, `?`, `[seq]`, not SQL `LIKE`'s `%`/`_`), excluding the target
+namespace itself in case the pattern would otherwise catch it too. This
+was validated against the real catalog used throughout this project's
+development: `synth_src_0*` correctly matched exactly the 8
+`synth_src_01`..`synth_src_08` namespaces and nothing from the
+differently-prefixed `synth_src_changing_*` set sitting alongside them in
+the same catalog.
+
+The mental model is deliberately close to dbt-utils'
+`get_relations_by_pattern` macro -- discover what matches a schema
+pattern, rather than maintaining an exhaustive explicit list by hand. The
+practical difference from that macro: this resolves namespaces (Iceberg's
+unit of "schema"), not individual tables -- table-level discovery within
+each matched namespace is a separate, already-existing step
+(`discover_common_tables()`, unchanged by this).
+
+A pattern is resolved fresh on every run, not cached -- add a new tenant
+namespace in Fivetran and it's picked up automatically next time this
+runs, no config change needed. The resolved list is always logged at INFO
+level, since silently discovering which namespaces feed a
+schema-modifying tool is exactly the kind of thing that should stay
+visible rather than being a hidden side effect of a glob matching more
+(or less) than intended.
+
 ## The four-step mechanism
 
 ### 1. Reserve

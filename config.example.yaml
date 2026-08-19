@@ -10,19 +10,36 @@ target_namespace: consolidated
 # Every source namespace to fold into the consolidated tables. These are
 # the Polaris/Iceberg namespaces your Fivetran connections land into --
 # typically one namespace per connection, one per tenant, or one per
-# customer database, depending on how your connectors are set up. List
-# every source namespace you want included; there is no limit on how many.
+# customer database, depending on how your connectors are set up.
 #
-# All listed namespaces are expected to share the same table names and a
+# All source namespaces are expected to share the same table names and a
 # structurally compatible schema (same columns meaning the same thing).
 # This tool does not handle sources with a genuinely different shape --
 # see the README's "What this does NOT yet handle" section before running
 # it against sources you aren't sure are structurally identical.
+#
+# Set EXACTLY ONE of the two options below -- explicit list, or pattern.
+
+# Option A: explicit list. Fine for a handful of sources, or when you want
+# to consolidate a specific subset rather than "everything matching X."
 source_namespaces:
   - sqlserver_tenant_001
   - sqlserver_tenant_002
   - sqlserver_tenant_003
   # ... add as many source namespaces as you have
+
+# Option B: a glob pattern instead of an explicit list -- comment out
+# source_namespaces above and uncomment this if you have dozens, hundreds,
+# or more source namespaces (this is the point of this tool: hand-listing
+# 400 Azure SQL databases in a config file defeats the purpose). This gets
+# resolved against your catalog's ACTUAL namespaces at run time
+# (list_namespaces()), not maintained as a static list -- add a new tenant
+# namespace in Fivetran and it's picked up on the next run automatically,
+# no config change needed. Matching uses glob semantics (*, ?, [seq]), not
+# SQL LIKE. The resolved namespace list is always logged at INFO level so
+# you can see exactly what a pattern matched before trusting it.
+#
+# source_namespace_pattern: "sqlserver_tenant_*"
 
 # Name of the bookkeeping column added to every consolidated table. It
 # records which source namespace each row came from, and it's also the

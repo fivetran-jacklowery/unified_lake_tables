@@ -17,11 +17,15 @@ that an internal sandbox script didn't:
      automatically whenever a table is loaded through pyiceberg's
      RestCatalog -- see catalog_properties() below and "Credentials: vended,
      not static" in docs/HOW_IT_WORKS.md.
-  2. Config-driven source discovery instead of a naming-convention hack. You
-     list your actual source namespaces in config.yaml; this script
-     auto-discovers which table names exist in ALL of them (see
-     discover_common_tables()) rather than requiring every table to be
-     enumerated by hand or every source to follow a {prefix}_{NN} pattern.
+  2. Config-driven source discovery instead of a naming-convention hack.
+     Either list your actual source namespaces in config.yaml explicitly,
+     or -- at real scale, where hand-listing 400 namespaces defeats the
+     point -- give a glob pattern (source_namespace_pattern, e.g.
+     "tenant_*") and this script resolves it against the catalog's actual
+     namespaces itself (see resolve_source_namespaces()). Either way, this
+     script then auto-discovers which table NAMES exist in ALL of those
+     namespaces (see discover_common_tables()) rather than requiring every
+     table to be enumerated by hand.
 
 WHAT THIS ACTUALLY DOES, in one paragraph: for every table name common to
 all configured source namespaces, it creates (or reuses) one target table
@@ -41,6 +45,7 @@ validated. Running this against a source doing anything else is unsupported
 and may produce incorrect results.
 """
 import argparse
+import fnmatch
 import itertools
 import logging
 import os
@@ -105,12 +110,24 @@ def load_config(path: str) -> dict:
             f"{path} and fill in your source namespaces."
         )
 
-    required = ["target_namespace", "source_namespaces", "source_id_column"]
+    required = ["target_namespace", "source_id_column"]
     missing = [k for k in required if not cfg.get(k)]
     if missing:
         raise SystemExit(f"{path} is missing required key(s): {missing}")
 
-    if not isinstance(cfg["source_namespaces"], list) or len(cfg["source_namespaces"]) < 2:
+    has_list = bool(cfg.get("source_namespaces"))
+    has_pattern = bool(cfg.get("source_namespace_pattern"))
+    if has_list and has_pattern:
+        raise SystemExit(
+            f"{path}: set only ONE of 'source_namespaces' or 'source_namespace_pattern', not both "
+            "-- ambiguous which one should win."
+        )
+    if not has_list and not has_pattern:
+        raise SystemExit(
+            f"{path} is missing required key(s): must set either 'source_namespaces' "
+            "(an explicit list) or 'source_namespace_pattern' (a glob, e.g. 'tenant_*')."
+        )
+    if has_list and (not isinstance(cfg["source_namespaces"], list) or len(cfg["source_namespaces"]) < 2):
         raise SystemExit(
             f"{path}: 'source_namespaces' must be a list of 2 or more namespaces "
             "(consolidating a single namespace into itself isn't a meaningful use of this tool)."
@@ -119,6 +136,58 @@ def load_config(path: str) -> dict:
     cfg.setdefault("table_workers", 8)
     cfg.setdefault("source_workers", 8)
     return cfg
+
+
+def resolve_source_namespaces(cat: "RestCatalog", cfg: dict) -> list:
+    """Return the concrete list of source namespaces to consolidate.
+
+    If cfg['source_namespaces'] is set, that explicit list is used as-is
+    (unchanged behavior). If cfg['source_namespace_pattern'] is set instead,
+    this auto-discovers every namespace that currently exists in the catalog
+    and matches that glob pattern (fnmatch semantics: '*' / '?' / '[seq]'),
+    rather than requiring every tenant/shard/region namespace to be
+    hand-enumerated one at a time.
+
+    This matters at the scale this tool is actually built for: asking
+    someone to list 400 Azure SQL databases or 10,000 ERP tables by name in
+    a config file defeats the point of a tool meant to handle exactly that
+    scale. The mental model is deliberately similar to dbt-utils'
+    get_relations_by_pattern -- discover what matches a schema pattern,
+    rather than requiring an exhaustive explicit list.
+
+    The target namespace is excluded from the match even if the pattern
+    would otherwise catch it (e.g. a target named 'tenant_consolidated'
+    under a 'tenant_*' pattern), since consolidating a target into itself
+    isn't meaningful. Raises SystemExit if a pattern is configured but
+    matches fewer than 2 namespaces, same validation load_config() already
+    applies to an explicit list.
+
+    Always logs the resolved list at INFO level -- auto-discovering which
+    namespaces get spliced into a schema-modifying tool is exactly the kind
+    of thing that should be visible and auditable, not a silent side effect
+    of a glob that matched more (or less) than intended.
+    """
+    if cfg.get("source_namespaces"):
+        return list(cfg["source_namespaces"])
+
+    pattern = cfg["source_namespace_pattern"]
+    all_namespaces = [".".join(ns) for ns in cat.list_namespaces()]
+    matched = sorted(
+        ns for ns in all_namespaces if fnmatch.fnmatch(ns, pattern) and ns != cfg["target_namespace"]
+    )
+    logger.info(
+        "source_namespace_pattern '%s' matched %d namespace(s) in the catalog: %s",
+        pattern,
+        len(matched),
+        matched,
+    )
+    if len(matched) < 2:
+        raise SystemExit(
+            f"source_namespace_pattern '{pattern}' matched only {len(matched)} namespace(s): {matched}. "
+            "Need 2 or more to consolidate. Check the pattern against your catalog's actual namespace "
+            "names (list_namespaces() is case-sensitive, exact-match-per-segment glob, not SQL LIKE)."
+        )
+    return matched
 
 
 def _require_env(name: str) -> str:
@@ -553,6 +622,7 @@ def run(cfg: dict, tables: list = None) -> dict:
     """
     t_run_start = time.time()
     driver_cat = get_catalog()
+    cfg["source_namespaces"] = resolve_source_namespaces(driver_cat, cfg)
     tables = tables or discover_common_tables(driver_cat, cfg["source_namespaces"])
     if not tables:
         raise SystemExit(

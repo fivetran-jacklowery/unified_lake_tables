@@ -50,16 +50,25 @@ def build_config_from_env() -> dict:
     real source-namespace list is configuration, not code, and belongs in
     the Lambda function's own config (or Secrets Manager), not committed to
     a repo or baked into a deployment zip.
+
+    Set EXACTLY ONE of SOURCE_NAMESPACES (comma-separated explicit list) or
+    SOURCE_NAMESPACE_PATTERN (a glob, e.g. "tenant_*") -- mirrors
+    config.yaml's Option A / Option B in config.example.yaml. A pattern is
+    resolved against the catalog's real namespaces by
+    register_consolidation.resolve_source_namespaces(), called from
+    rc.run() -- this function only validates that one of the two is set
+    and passes it through unresolved, since resolving a pattern needs a
+    live catalog connection this function deliberately doesn't open itself.
     """
     target_namespace = os.environ.get("TARGET_NAMESPACE")
     source_namespaces_raw = os.environ.get("SOURCE_NAMESPACES")
+    source_namespace_pattern = os.environ.get("SOURCE_NAMESPACE_PATTERN")
     source_id_column = os.environ.get("SOURCE_ID_COLUMN")
 
     missing = [
         name
         for name, val in [
             ("TARGET_NAMESPACE", target_namespace),
-            ("SOURCE_NAMESPACES", source_namespaces_raw),
             ("SOURCE_ID_COLUMN", source_id_column),
         ]
         if not val
@@ -71,20 +80,35 @@ def build_config_from_env() -> dict:
             "this function needs (Polaris OAuth credentials + these config values)."
         )
 
-    source_namespaces = [ns.strip() for ns in source_namespaces_raw.split(",") if ns.strip()]
-    if len(source_namespaces) < 2:
+    if source_namespaces_raw and source_namespace_pattern:
         raise RuntimeError(
-            "SOURCE_NAMESPACES must be a comma-separated list of 2 or more namespaces "
-            f"(got: {source_namespaces_raw!r})."
+            "Set only ONE of SOURCE_NAMESPACES or SOURCE_NAMESPACE_PATTERN, not both."
+        )
+    if not source_namespaces_raw and not source_namespace_pattern:
+        raise RuntimeError(
+            "Missing required Lambda environment variable: set either SOURCE_NAMESPACES "
+            "(comma-separated) or SOURCE_NAMESPACE_PATTERN (a glob, e.g. 'tenant_*')."
         )
 
-    return {
+    cfg = {
         "target_namespace": target_namespace,
-        "source_namespaces": source_namespaces,
         "source_id_column": source_id_column,
         "table_workers": int(os.environ.get("TABLE_WORKERS", "8")),
         "source_workers": int(os.environ.get("SOURCE_WORKERS", "8")),
     }
+
+    if source_namespaces_raw:
+        source_namespaces = [ns.strip() for ns in source_namespaces_raw.split(",") if ns.strip()]
+        if len(source_namespaces) < 2:
+            raise RuntimeError(
+                "SOURCE_NAMESPACES must be a comma-separated list of 2 or more namespaces "
+                f"(got: {source_namespaces_raw!r})."
+            )
+        cfg["source_namespaces"] = source_namespaces
+    else:
+        cfg["source_namespace_pattern"] = source_namespace_pattern
+
+    return cfg
 
 
 def handler(event, context):
@@ -102,10 +126,14 @@ def handler(event, context):
     cfg = build_config_from_env()
     tables = event.get("tables") or None
 
+    # cfg has EITHER 'source_namespaces' (explicit) OR
+    # 'source_namespace_pattern' (resolved against the live catalog inside
+    # rc.run() -> resolve_source_namespaces(), which logs the resolved list
+    # itself) -- log whichever one is actually configured here.
     logger.info(
         "Starting registration run: target=%s sources=%s tables=%s",
         cfg["target_namespace"],
-        cfg["source_namespaces"],
+        cfg.get("source_namespaces") or f"pattern:{cfg.get('source_namespace_pattern')!r}",
         tables or "auto-discover",
     )
 

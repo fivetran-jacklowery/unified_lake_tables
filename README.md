@@ -74,7 +74,9 @@ mechanism.
   connection details for that destination.
 - Two or more source namespaces sharing the same table names and a
   structurally compatible schema (same connector, different tenants/
-  accounts/databases is the common case).
+  accounts/databases is the common case). List them explicitly, or give a
+  glob pattern (e.g. `tenant_*`) and let this tool discover which
+  namespaces actually exist and match it -- see `config.example.yaml`.
 - Python 3.10+.
 - **No AWS credentials of any kind.** This tool authenticates to Polaris
   with OAuth only; Polaris vends short-lived, scoped AWS storage
@@ -90,8 +92,9 @@ cp .env.example .env
 # edit .env with your Polaris OAuth client-credentials
 
 cp config.example.yaml config.yaml
-# edit config.yaml: list your source namespaces, name the target namespace
-# and the bookkeeping/partition column
+# edit config.yaml: list your source namespaces (or give a glob pattern --
+# see config.example.yaml's Option B -- if you have too many to list by
+# hand), name the target namespace and the bookkeeping/partition column
 
 python scripts/register_consolidation.py
 # then, any time you want a sanity check:
