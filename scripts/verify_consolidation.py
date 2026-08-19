@@ -52,6 +52,7 @@ from register_consolidation import (
     catalog_properties,
     discover_common_tables,
     load_config,
+    resolve_source_namespaces,
 )
 from pyiceberg.catalog.rest import RestCatalog
 
@@ -150,6 +151,11 @@ def main():
     load_dotenv()
     cfg = load_config(args.config)
     cat = get_catalog()
+    # Same resolution register_consolidation.py's run() does -- cfg may have
+    # either an explicit source_namespaces list or a source_namespace_pattern
+    # glob (see config.example.yaml); this normalizes to a concrete list
+    # either way, so everything below can stay unaware of which one was set.
+    cfg["source_namespaces"] = resolve_source_namespaces(cat, cfg)
     tables = args.tables or discover_common_tables(cat, cfg["source_namespaces"])
     if not tables:
         logger.error("No tables to verify.")

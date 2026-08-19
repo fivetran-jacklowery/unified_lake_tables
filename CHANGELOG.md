@@ -2,6 +2,61 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Added
+
+- **Pattern-based source namespace discovery.** `config.yaml` now accepts
+  `source_namespace_pattern` (a glob, e.g. `"tenant_*"`) as an alternative to
+  hand-enumerating `source_namespaces`, resolved against the catalog's real
+  namespaces at run time via `resolve_source_namespaces()` (`fnmatch`
+  matching against `RestCatalog.list_namespaces()`, excluding the target
+  namespace, always logged, `SystemExit` if fewer than 2 namespaces match).
+  Directly analogous to dbt-utils' `get_relations_by_pattern` macro. Exactly
+  one of `source_namespaces` / `source_namespace_pattern` must be set --
+  `load_config()` enforces this. Threaded through
+  `register_consolidation.py`'s `run()`, `verify_consolidation.py`'s
+  `main()`, `config.example.yaml`, `docs/HOW_IT_WORKS.md`, `README.md`,
+  `SKILL.md`, and the AWS Lambda example (`SOURCE_NAMESPACE_PATTERN` env
+  var). Validated live against a real Polaris catalog (`synth_src_0*` and
+  `synth_wide_*` patterns resolving to the expected exact namespace sets;
+  confirmed `SystemExit` on a too-narrow pattern).
+- `register_consolidation.py`'s core loop extracted into a standalone
+  `run(cfg, tables=None) -> dict` function (returning a JSON-serializable
+  summary), so `main()` is now a thin CLI wrapper and the same logic can be
+  called from other entry points (e.g. the AWS Lambda example's
+  `lambda_function.py`).
+- `examples/aws-lambda/`: a real, working example of running
+  `register_consolidation.py` as a scheduled AWS Lambda function (handler,
+  packaging script, IAM/EventBridge setup, and a walkthrough README),
+  including a Docker-based cross-platform build path for producing a
+  correct Linux/arm64 deployment package regardless of build-host OS.
+
+### Fixed
+
+- `verify_consolidation.py` would raise `KeyError` on `cfg["source_namespaces"]`
+  if a config used the new `source_namespace_pattern` instead of an explicit
+  list (the pattern was never resolved before use). Fixed by calling the same
+  `resolve_source_namespaces()` helper `register_consolidation.py`'s `run()`
+  uses, immediately after opening the catalog connection.
+
+### Confirmed (previously only hypothesized)
+
+- The README's Troubleshooting entry "Everything works except reading actual
+  data ... outside its own default storage location" -- previously written
+  as a known catalog-integration risk in the abstract -- was reproduced live
+  during this release's testing: an independent row-count check in
+  `verify_consolidation.py`, run against a real consolidated table, hit
+  `OSError: ... AWS Error ACCESS_DENIED during HeadObject operation` reading
+  a spliced-in Parquet file that physically lives under a different source
+  namespace's default storage location. This is not a regression from the
+  pattern-discovery work above -- pattern resolution and table discovery
+  both completed correctly first -- it's confirmation of a pre-existing,
+  previously-untested gap in how vended, per-table storage credentials
+  interact with this tool's whole-point cross-namespace file splicing. See
+  the README's Troubleshooting section for the current guidance (broaden the
+  reading engine's catalog-integration storage-location allowlist).
+
 ## [1.0.0]
 
 Initial public-facing release, adapted from an internal R&D reference

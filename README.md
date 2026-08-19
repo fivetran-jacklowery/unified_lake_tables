@@ -225,15 +225,21 @@ tool's cost model assumes -- worth a closer look, and the run's summary
 output flags this explicitly.
 
 **Everything works except reading actual data (`SELECT COUNT(*)` succeeds
-but a real query fails on a file path).** This is a known catalog-
-integration gotcha, not specific to this tool: a vended-credential catalog
-integration can fail to cover a table whose manifest points at files
-**outside its own default storage location** -- which is exactly what this
-tool does by design (the whole point is pointing a target table's manifest
-at a different table's files). If you hit this from a downstream engine
-(e.g. Snowflake) reading the consolidated table, check whether that
-engine's catalog integration needs a broader storage-location allowlist
-than a single table's default location.
+but a real query fails on a file path, e.g. `AWS Error ACCESS_DENIED during
+HeadObject operation`).** This is a confirmed catalog-integration gotcha,
+not specific to this tool -- and not hypothetical: it was reproduced live
+during `source_namespace_pattern` testing, when `verify_consolidation.py`'s
+independent row-count check hit exactly this error reading a spliced-in
+file. A vended-credential catalog integration can fail to cover a table
+whose manifest points at files **outside its own default storage
+location** -- which is exactly what this tool does by design (the whole
+point is pointing a target table's manifest at a different table's files).
+If you hit this from a downstream engine (e.g. Snowflake) reading the
+consolidated table, or from `verify_consolidation.py` itself, check whether
+that engine's catalog integration needs a broader storage-location
+allowlist than a single table's default location -- this is not a bug in
+the registration logic, and re-running `register_consolidation.py` will not
+fix it.
 
 **A downstream Snowflake-side Iceberg table on a consolidated table starts
 erroring after a rebuild.** If a consolidated table ever gets dropped and
