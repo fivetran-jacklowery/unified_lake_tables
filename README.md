@@ -241,6 +241,29 @@ allowlist than a single table's default location -- this is not a bug in
 the registration logic, and re-running `register_consolidation.py` will not
 fix it.
 
+**`register_consolidation.py` itself can hit this same ACCESS_DENIED error
+during collision handling.** Reproduced live: running a real two-source
+field-id collision through the script, the no-rewrite splice and the
+free-widen step both completed and committed correctly, but the run then
+crashed inside step 4's own idempotency check (the `target_table.scan(...)`
+call that looks for rows already rewritten in a prior run), for the exact
+reason above -- by that point the target table's manifest already
+references files from every source namespace, and the vended credential
+only covers the target's own default storage location. This is a real,
+currently-unresolved gap in the collision-rewrite path specifically (see
+`CHANGELOG.md`'s "Known issue" entry for the full reproduction and root
+cause) -- **the script has not been changed to work around it yet.**
+Practically: the splice path (the overwhelming majority of what this tool
+does) is unaffected and commits fine regardless; only a genuine field-id
+collision's rewrite step is at risk of failing outright rather than
+resolving. If you need to independently verify or read across a
+consolidated table's full manifest in the meantime, use DuckDB's Iceberg
+extension attached directly to the Polaris REST catalog instead of
+`pyiceberg`'s own `RestCatalog` client -- confirmed live, DuckDB reads these
+same cross-namespace spliced files (including the exact file that failed
+via `pyiceberg`) without issue, likely because it requests or receives a
+different credential scope than `pyiceberg`'s own vended-credentials path.
+
 **A downstream Snowflake-side Iceberg table on a consolidated table starts
 erroring after a rebuild.** If a consolidated table ever gets dropped and
 recreated at the catalog level, any Snowflake-side `ICEBERG TABLE` pointed

@@ -170,6 +170,22 @@ identity column, and appended for real via `target_table.append()`. This is
 the only place actual bytes get rewritten in the whole pipeline, and the
 cost is bounded by the size of the drift, not the size of the table.
 
+**Confirmed live gap in this step's idempotency check:** right before doing
+the real rewrite, this step checks whether a prior run already handled this
+collision (`already_rewritten = target_table.scan(row_filter=..., ...)`).
+That check reads the *target* table, whose manifest by this point already
+references files spliced in from every source namespace -- and Polaris's
+vended credentials are scoped to the target table's own default storage
+location, not to every namespace whose files that manifest happens to
+reference. Reproduced live: this check can fail with
+`AWS Error ACCESS_DENIED during HeadObject operation` reading a
+cross-namespace file, crashing the run at exactly this point rather than
+completing the collision resolution. The splice path (steps 2-3) is
+unaffected and commits first regardless. See `README.md`'s Troubleshooting
+section and `CHANGELOG.md`'s "Known issue" entry for the full reproduction
+and a confirmed workaround (DuckDB's Iceberg extension reads the same files
+without issue) -- not yet fixed in this script itself.
+
 ### Idempotency
 
 Re-running `register_consolidation.py` against sources with nothing new

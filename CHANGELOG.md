@@ -57,6 +57,59 @@ All notable changes to this project are documented here.
   the README's Troubleshooting section for the current guidance (broaden the
   reading engine's catalog-integration storage-location allowlist).
 
+### Known issue: collision-rewrite path can hit ACCESS_DENIED under vended credentials
+
+Reproduced live (not hypothetical) by deliberately running `register_consolidation.py`
+against a real two-source field-id collision (`synth_src_changing_03` and
+`synth_src_changing_04` both independently added a new column that landed on
+the same physical field id in a `warehouses`-style table). The no-rewrite
+splice and the free widen-for-free step both completed and committed
+correctly. The run then crashed inside **step 4's own idempotency check**
+(`register_table()`, the `already_rewritten = target_table.scan(...)` call
+right before the real per-collision rewrite) with:
+
+```
+OSError: ... AWS Error ACCESS_DENIED during HeadObject operation ...
+'<source-namespace>/<table>/data/<file>.parquet' in bucket '<lake bucket>'
+```
+
+**Why this happens:** by the time step 4 runs, the target table's manifest
+already contains file references spliced in from every source namespace
+(that's step 2's whole job). Polaris vends AWS credentials scoped to a
+table's own default storage location, not to every namespace whose files
+happen to be referenced in that table's manifest. Reading the *target*
+table's data -- which step 4's idempotency check does, to see whether this
+collision was already resolved in a prior run -- means reading files that
+physically live under a *different* namespace's prefix, which the vended
+credential doesn't cover. This is the same root cause as the
+`verify_consolidation.py` finding above, but a more serious instance: it's
+inside the core registration script's own collision-handling path, not a
+separate, optional post-run check.
+
+**Practical impact:** on a genuine field-id collision, the run fails instead
+of resolving it, contradicting the "detects and safely resolves" collision
+claim in this script's own docstring. The no-rewrite splice for every
+non-colliding file still commits successfully first (confirmed: all 8
+sources' base data landed correctly, and the winning column's free-widen
+data was correctly isolated to only its real source), so a crash here does
+not corrupt what's already been written -- it just means the specific
+colliding column's fresh data is left un-rewritten (schema column created,
+but empty) until the run can complete successfully.
+
+**Confirmed workaround, without touching the script:** DuckDB's Iceberg
+extension, attached directly to the same Polaris REST catalog, reads these
+exact same cross-namespace spliced files without issue -- confirmed live
+against the very table that crashed via `pyiceberg` above (row counts and
+per-column null checks across all 8 partitions succeeded via DuckDB in the
+same session). Read-only verification or idempotency-style checks that need
+to read across a consolidated table's full manifest should use DuckDB (or
+another reader that requests/receives broader-scoped credentials) rather
+than `pyiceberg`'s own `RestCatalog` client, until vended-credential storage
+scoping for cross-namespace manifests is resolved upstream or worked around
+in this tool directly. **Not yet changed in the script itself** -- this is
+documentation of a real, reproduced gap and a validated workaround, not a
+code fix.
+
 ## [1.0.0]
 
 Initial public-facing release, adapted from an internal R&D reference
