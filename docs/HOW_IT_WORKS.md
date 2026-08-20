@@ -186,13 +186,115 @@ section and `CHANGELOG.md`'s "Known issue" entry for the full reproduction
 and a confirmed workaround (DuckDB's Iceberg extension reads the same files
 without issue) -- not yet fixed in this script itself.
 
+### 5. Retire orphaned files (copy-on-write cleanup)
+
+Steps 1-4 assume a source only ever adds files -- new data lands in new
+physical files, and nothing already spliced in ever stops existing at the
+source. That assumption is wrong the moment a source does a genuine
+row-level UPDATE or DELETE, and it went unverified in this tool's 1.0.0
+release, which cited the wrong mechanism for the risk ("merge-on-read
+sources / delete files" in the README and CHANGELOG). Reading Fivetran's
+actual Managed Data Lake writer source
+(`ManagedDataLakeWriter.java`) shows there are no delete files anywhere in
+it: `upsert()`, `update()`, and `delete()` all locate every existing
+physical file that could contain an affected primary key, rewrite each one
+in full via an internal `UpdateWorkflow`/`DeleteWorkflow`, and commit the
+swap atomically via Iceberg's `OverwriteFiles` transaction
+(`deleteFile()` + `addFile()` in one commit, confirmed in the writer's
+`commit()` method). No `write.delete.mode`/`write.update.mode`/
+`write.merge.mode` table properties are set anywhere -- copy-on-write (COW)
+is the only path this writer implements, not a configurable choice.
+
+**Why that broke the four-step mechanism above:** `already_registered_paths()`
+(now `already_registered_by_source()`) only ever asked "is this source file
+path new to me, splice it in." It never asked the reverse question: "did a
+file I already spliced in disappear from this source's current snapshot?"
+COW retires the old file from the source's current snapshot the instant it
+rewrites it -- the source itself reads correctly (new file replaces old in
+its own manifest) -- but the target kept referencing the retired file
+forever, because nothing here ever revisited a file once it was spliced in.
+Every row that stale file held became a permanent duplicate against its
+replacement, and a genuinely-updated row ended up present in the target
+with both its stale and current values simultaneously, with no column
+distinguishing which was which.
+
+**Reproduced live** with two minimal single-table test connectors
+(`connectors/cow_test_01`/`cow_test_02`) before any fix was written: a
+30-row baseline consolidated cleanly to 60 rows across both sources.
+Re-syncing `cow_test_01` with a connector that re-upserts one *existing*
+primary key with changed values (instead of inserting a new one) confirmed,
+by directly inspecting the source's Iceberg snapshot, that its original
+single 30-row file was gone from the current snapshot -- replaced by two
+brand-new files (1 changed row + 29 unchanged rows = 30, still). Re-running
+`register_consolidation.py` unchanged spliced both new files in as "never
+seen before" without retiring the stale original, producing 90 rows instead
+of 60: all 30 of `cow_test_01`'s rows duplicated (the COW rewrite touched
+the whole file, not just the one changed row), with the specifically-updated
+row present as both `(green, active, v1)` and `(orange, UPDATED, v2)`
+simultaneously.
+
+**The fix:** `already_registered_by_source()` returns the actual `DataFile`
+objects (not just path strings), grouped by source via the partition value
+already recorded on every spliced entry (`f.partition[0]`). Each source's
+current file listing is now diffed both directions every run: new paths
+still splice in exactly as step 2 always did; any previously-registered
+path no longer present in that source's current snapshot is collected as
+orphaned. If any orphans exist, the commit swaps from the plain
+`_append_snapshot_producer` (fast-append, used when there's nothing to
+retire) to `transaction.update_snapshot().overwrite()` -- a **public**
+pyiceberg 0.11.1 API, not a private hack like the reserved-field-id
+mechanism in step 1 -- calling `delete_data_file()` on each orphan and
+`append_data_file()` on its replacement(s) in one atomic commit. This
+mirrors Fivetran's own `OverwriteFiles.deleteFile()` + `addFile()` pattern
+exactly, one layer up the stack.
+
+Confirmed via the target's own snapshot history after the fix: the two
+prior splice commits recorded as `Operation.APPEND` (2 files added each);
+the retirement commit recorded as `Operation.OVERWRITE` (1 file deleted,
+target manifest count 2 -> 3). Re-running the exact broken scenario, no
+config changes: retired the 1 orphaned file, removed the 30 stale rows,
+table back to the correct 60, zero duplicates, the previously-updated
+widget showing only its current value. A second run immediately after was
+a clean no-op (0 spliced, 0 rewritten, 0 orphaned) -- idempotency holds
+under the new logic exactly as it did before.
+
+**Overhead, measured, not estimated:** a pure no-op run (nothing new,
+nothing orphaned) took 5.6s; the original splice-only baseline took 7.2s;
+the orphan-retirement run took 7.3s -- retiring an orphan costs about the
+same as a normal splice commit, not meaningfully more, at this test's
+scale. Under the hood this is because `_OverwriteFiles._existing_manifests()`
+only rewrites a manifest file if it actually contains a deleted entry;
+manifests untouched by the retirement are reused by reference, unchanged --
+so this stays a metadata-only operation, no Parquet data read or rewritten,
+consistent with every other step in this mechanism.
+
+**Real scaling caveat, not just a footnote:** a manifest batches many
+`DataFile` entries together (potentially thousands, at production scale
+with manifest merging enabled), and the rewrite-if-touched rule means
+retiring even one orphaned file forces a full rewrite of *every other
+entry* sharing that manifest, not just the orphan. The cost of a retirement
+therefore scales with the size of the manifest(s) the orphan happens to
+share, not with the number of orphaned files itself. This was invisible at
+this test's scale (one file, one small manifest) and has not been
+re-measured against a production-sized, frequently-updated source with
+large, merged manifests -- don't assume the 7.3s number above holds at
+that scale.
+
+**Still not separately exercised:** a genuine DELETE with no replacement
+file at all (as opposed to an UPDATE, which always produces a replacement).
+The retirement logic should handle a pure delete identically -- it doesn't
+require the deleted file to have a same-run replacement, only that it's
+gone from the source's current listing -- but this was confirmed by
+mechanism, not by running a dedicated delete-only reproduction the way the
+update case above was.
+
 ### Idempotency
 
 Re-running `register_consolidation.py` against sources with nothing new
-must be a safe no-op. Two separate mechanisms make that true for the two
-different code paths:
+must be a safe no-op. Three separate mechanisms make that true for the
+three different code paths:
 
-- **No-rewrite path**: `already_registered_paths()` reads the target's
+- **No-rewrite path**: `already_registered_by_source()` reads the target's
   existing manifest before deciding what to splice, and skips any file
   whose path is already registered. An early, non-idempotent version of
   this technique had no such check and silently doubled every row on a
@@ -203,6 +305,13 @@ different code paths:
   `register_table()` checks whether the target already has at least as many
   non-null rows for that (source, field) pair as the drifted file set would
   produce, and skips if so.
+- **Retirement path** (see step 5 above): an orphan is, by construction,
+  only detected once -- the moment it's retired via `delete_data_file()`, it
+  stops existing in the target's manifest, so a second run simply won't
+  find it in `already_registered_by_source()` anymore and has nothing left
+  to retire for that file. Confirmed live: a run immediately following a
+  real retirement came back with 0 spliced, 0 rewritten, 0 orphaned -- a
+  clean no-op, same as the other two paths.
 
 ### Partition pruning
 
@@ -287,7 +396,10 @@ documented in this repo's CHANGELOG).
 ## What's proven versus what isn't
 
 See the README's "What this does NOT yet handle" section for the customer-facing
-version. In short: only "a source adds a new nullable column" was validated
-against real infrastructure. Renamed columns, dropped columns, changed data
-types, and merge-on-read/delete files are different Iceberg mechanisms
-entirely and are out of scope for this tool as written.
+version. In short: "a source adds a new nullable column" (steps 1-4) and "a
+source performs a row-level UPDATE, retiring the old file via copy-on-write"
+(step 5) were both validated against real infrastructure. Renamed columns,
+dropped columns, and changed data types are different Iceberg mechanisms
+entirely and remain out of scope for this tool as written. A pure DELETE
+(no replacement file) is expected to work via the same step 5 mechanism but
+wasn't separately exercised as its own reproduction -- see step 5 above.

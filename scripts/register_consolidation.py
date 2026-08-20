@@ -35,14 +35,21 @@ read or rewritten for the common case. It also detects the one real
 correctness risk this technique introduces (two independently-evolving
 sources landing a new column on the same internal Iceberg field id with
 different meanings) and resolves it safely, at a real but delta-scoped
-rewrite cost, only when that collision actually happens. See
-docs/HOW_IT_WORKS.md for the full mechanism.
+rewrite cost, only when that collision actually happens. It also detects
+and retires files that Fivetran's copy-on-write writer has silently
+replaced at a source since the last run (see
+already_registered_by_source() and the orphan-retirement logic in
+register_table()), so a source doing row-level UPDATEs or DELETEs doesn't
+leave stale, duplicated data behind in the target. See docs/HOW_IT_WORKS.md
+for the full mechanism, including measured overhead for the retirement
+path.
 
 WHAT THIS DOES NOT HANDLE (see the README before running this against
-production data): renamed columns, dropped columns, changed data types, and
-merge-on-read/delete files. Only "a source adds a new nullable column" was
-validated. Running this against a source doing anything else is unsupported
-and may produce incorrect results.
+production data): renamed columns, dropped columns, and changed data types.
+Only "a source adds a new nullable column" and "a source performs a
+row-level UPDATE/DELETE handled via copy-on-write" have been validated.
+Running this against a source doing anything else (a rename, a drop, a type
+change) is unsupported and may produce incorrect results.
 """
 import argparse
 import fnmatch
@@ -366,20 +373,50 @@ def file_has_drift_beyond(f, baseline_max_field_id: int):
     return None
 
 
-def already_registered_paths(target_table) -> set:
-    """File paths already present in the target table's manifest. Checked
-    before deciding what still needs to be spliced in, so re-running this
-    script with nothing new from any source is a safe no-op instead of
-    double-registering every file (the exact bug an early, non-idempotent
-    version of this technique had: a rerun came back with every source's row
-    count exactly doubled)."""
-    paths = set()
+def already_registered_by_source(target_table) -> dict:
+    """Every file currently in the target table's manifest, grouped by which
+    source namespace it was spliced in from (via the identity partition on
+    source_id_column -- f.partition[0] is that source's namespace string).
+
+    Two things this is used for:
+      1. The original idempotency check: skip any file whose path is already
+         registered, so re-running this script with nothing new from any
+         source is a safe no-op instead of double-registering every file
+         (the bug an early, non-idempotent version of this technique had: a
+         rerun came back with every source's row count exactly doubled).
+      2. NEW: orphan detection. Fivetran's Managed Data Lake writer is
+         copy-on-write for UPDATE and DELETE (confirmed by reading
+         ManagedDataLakeWriter.java: upsert()/update()/delete() all rewrite
+         whichever existing physical file(s) could contain the affected
+         primary key(s) into brand-new file(s), then atomically swap old for
+         new via Iceberg's OverwriteFiles -- deleteFile() + addFile() in one
+         transaction). That means a source file this tool already spliced in
+         can simply stop existing in the source's CURRENT snapshot on a
+         later sync, replaced by a new file with the updated content. This
+         tool used to have no way to notice that -- it only ever asked "is
+         this source file new to me, splice it in," never "did a file I
+         already spliced in get retired at the source." The result: the
+         stale old file stays in the target forever, sitting right alongside
+         its replacement, so every row that file held becomes a permanent
+         duplicate -- and for any row that was genuinely updated, the target
+         holds both the stale AND current values simultaneously with no way
+         to tell which is which. Reproduced live against real Fivetran
+         infrastructure before this fix existed (see CHANGELOG.md).
+
+         Returning DataFile objects here (not just path strings) is what
+         lets the caller pass an orphaned entry straight to
+         _OverwriteFiles.delete_data_file() -- that call needs the actual
+         DataFile, not its path.
+    """
+    by_source = {}
     try:
         for task in target_table.scan().plan_files():
-            paths.add(task.file.file_path)
+            f = task.file
+            src = f.partition[0]
+            by_source.setdefault(src, {})[f.file_path] = f
     except Exception:
         pass
-    return paths
+    return by_source
 
 
 def _load_source_files(source_namespace: str, table_name: str):
@@ -421,7 +458,8 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         logger.info("  [%s] created target table, %s field_id=%d", table_name, source_id_column, actual_id)
         assert actual_id == RESERVED_FIELD_ID_BASE
 
-    already = already_registered_paths(target_table)
+    already_by_source = already_registered_by_source(target_table)
+    already = {p for paths in already_by_source.values() for p in paths}
 
     # 1. Detect every source's drifted files, in parallel across sources.
     files_by_source = {}
@@ -488,9 +526,16 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         needs_rewrite_sources_by_field.setdefault(field_id, set()).add(ns)
 
     new_files = []
+    orphaned_files = []  # DataFile objects to retire: previously spliced in
+                         # from a source, but no longer part of that
+                         # source's CURRENT file listing (copy-on-write swap)
     total_new_rows = 0
+    total_orphaned_rows = 0
     for ns in source_namespaces:
         _, files = files_by_source[ns]
+        current_paths_this_source = {task.file.file_path for task in files}
+        registered_this_source = already_by_source.get(ns, {})
+
         files_ok, rows_this_source, files_skipped_already, files_skipped_rewrite = 0, 0, 0, 0
         for task in files:
             f = task.file
@@ -520,15 +565,49 @@ def register_table(table_name: str, cfg: dict) -> tuple:
             files_ok += 1
             rows_this_source += f.record_count
         total_new_rows += rows_this_source
+
+        # Orphan check: any path this tool already spliced in for this
+        # source, that ISN'T in the source's current file listing anymore,
+        # was retired at the source by a copy-on-write rewrite and needs to
+        # be retired here too -- otherwise its rows sit stale in the target
+        # forever, duplicated against whatever replacement file(s) just got
+        # spliced in above.
+        orphaned_this_source = [
+            df for path, df in registered_this_source.items() if path not in current_paths_this_source
+        ]
+        orphaned_rows_this_source = sum(df.record_count for df in orphaned_this_source)
+        orphaned_files.extend(orphaned_this_source)
+        total_orphaned_rows += orphaned_rows_this_source
+
         note = []
         if files_skipped_already:
             note.append(f"{files_skipped_already} already registered")
         if files_skipped_rewrite:
             note.append(f"{files_skipped_rewrite} pending physical rewrite")
+        if orphaned_this_source:
+            note.append(f"{len(orphaned_this_source)} orphaned file(s) retired ({orphaned_rows_this_source} stale rows)")
         flag = f" ({', '.join(note)})" if note else ""
         logger.info("  [%s] %s: %d file(s) spliced in, %d rows%s", table_name, ns, files_ok, rows_this_source, flag)
 
-    if new_files:
+    if orphaned_files:
+        # A retirement is present -- must commit via an OVERWRITE-type
+        # transaction (delete_data_file() + append_data_file() together, in
+        # the same commit) rather than a pure fast-append. Under the hood
+        # this only rewrites the small Avro MANIFEST file(s) that mixed a
+        # retired entry in with other still-valid ones -- never the
+        # underlying Parquet data files -- so it stays a metadata-only
+        # operation, same as the pure-splice path, just with a bit more
+        # manifest bookkeeping. Only paid when an orphan is actually
+        # detected; every other run (the common case) still uses the
+        # cheaper pure-append path below, unchanged.
+        with target_table.transaction() as txn:
+            with txn.update_snapshot({}).overwrite() as ov:
+                for df in orphaned_files:
+                    ov.delete_data_file(df)
+                for df in new_files:
+                    ov.append_data_file(df)
+        target_table = cat.load_table(target_id)
+    elif new_files:
         with target_table.transaction() as txn:
             with txn._append_snapshot_producer({}) as append_files:
                 for df in new_files:
@@ -592,14 +671,17 @@ def register_table(table_name: str, cfg: dict) -> tuple:
     total = total_new_rows + rewritten_rows
     elapsed = time.time() - t_start
     logger.info(
-        "  DONE %s: %d file(s) spliced (%d rows, no-rewrite), %d row(s) rewritten/appended (%.1fs)",
+        "  DONE %s: %d file(s) spliced (%d rows, no-rewrite), %d row(s) rewritten/appended, "
+        "%d orphaned file(s) retired (%d stale rows removed) (%.1fs)",
         table_name,
         len(new_files),
         total_new_rows,
         rewritten_rows,
+        len(orphaned_files),
+        total_orphaned_rows,
         elapsed,
     )
-    return table_name, total_new_rows, rewritten_rows, elapsed
+    return table_name, total_new_rows, rewritten_rows, len(orphaned_files), total_orphaned_rows, elapsed
 
 
 # --------------------------------------------------------------------------
@@ -639,18 +721,21 @@ def run(cfg: dict, tables: list = None) -> dict:
     )
 
     grand_spliced, grand_rewritten = 0, 0
+    grand_orphaned_files, grand_orphaned_rows = 0, 0
     per_table_timing = []
     with ThreadPoolExecutor(max_workers=cfg["table_workers"]) as ex:
         futs = {ex.submit(register_table, t, cfg): t for t in tables}
         for fut in as_completed(futs):
             t = futs[fut]
             try:
-                table_name, spliced, rewritten, elapsed = fut.result()
+                table_name, spliced, rewritten, orphaned_files, orphaned_rows, elapsed = fut.result()
             except Exception:
                 logger.exception("FAILED registering table '%s'", t)
                 raise
             grand_spliced += spliced
             grand_rewritten += rewritten
+            grand_orphaned_files += orphaned_files
+            grand_orphaned_rows += orphaned_rows
             per_table_timing.append((table_name, elapsed))
 
     wall_clock = time.time() - t_run_start
@@ -660,6 +745,8 @@ def run(cfg: dict, tables: list = None) -> dict:
         "sources": len(cfg["source_namespaces"]),
         "total_spliced": grand_spliced,
         "total_rewritten": grand_rewritten,
+        "total_orphaned_files_retired": grand_orphaned_files,
+        "total_orphaned_rows_removed": grand_orphaned_rows,
         "grand_total": grand_spliced + grand_rewritten,
         "wall_clock_seconds": round(wall_clock, 1),
         "slowest_tables": slowest,
@@ -686,8 +773,18 @@ def main():
     print(f"TABLES: {summary['tables']}  SOURCES: {summary['sources']}")
     print(f"TOTAL SPLICED (no-rewrite): {summary['total_spliced']}")
     print(f"TOTAL REWRITTEN (collision-only): {summary['total_rewritten']}")
+    print(f"TOTAL ORPHANED FILES RETIRED (copy-on-write cleanup): {summary['total_orphaned_files_retired']}")
+    print(f"TOTAL STALE ROWS REMOVED: {summary['total_orphaned_rows_removed']}")
     print(f"GRAND TOTAL: {summary['grand_total']}")
     print(f"WALL CLOCK: {summary['wall_clock_seconds']}s")
+    if summary["total_orphaned_files_retired"] > 0:
+        print(
+            f"\nNOTE: {summary['total_orphaned_files_retired']} file(s) previously spliced in were retired this "
+            "run because they no longer exist in their source's current snapshot (a copy-on-write update or "
+            "delete rewrote them at the source). Retiring them only rewrites the small manifest metadata file "
+            "that referenced them -- no Parquet data was read or rewritten -- but it does mean this run's "
+            "commit was an OVERWRITE-type snapshot, not a pure append, for every table where this happened."
+        )
     if summary["total_rewritten"] > 0:
         print(
             f"\nNOTE: {summary['total_rewritten']} row(s) went through the rewrite/collision path this run. "

@@ -110,6 +110,95 @@ in this tool directly. **Not yet changed in the script itself** -- this is
 documentation of a real, reproduced gap and a validated workaround, not a
 code fix.
 
+### Fixed: copy-on-write updates/deletes were silently duplicating and resurrecting rows
+
+Found via a piece of external feedback on this technique, then reproduced
+live (not hypothetical) before being fixed. The 1.0.0 release's "Explicitly
+out of scope" section named the wrong mechanism for this risk -- it said
+"merge-on-read sources (delete files)," but reading Fivetran's actual
+Managed Data Lake writer source (`ManagedDataLakeWriter.java`) shows there
+are no delete files anywhere in that writer at all. `upsert()`, `update()`,
+and `delete()` all use pure copy-on-write: the writer finds every existing
+physical file that could contain an affected primary key, rewrites it in
+full via an internal `UpdateWorkflow`/`DeleteWorkflow`, and atomically swaps
+old file for new via Iceberg's `OverwriteFiles` transaction
+(`deleteFile()` + `addFile()` in one commit). No position or equality
+deletes, no `write.delete.mode`/`write.update.mode` table properties set
+anywhere -- COW is the only path this writer implements.
+
+**Why that broke this tool:** `already_registered_paths()` (as it existed
+before this fix) only ever asked "is this source file path new to me,
+splice it in." It never asked "did a file I already spliced in get retired
+at the source." Since COW removes the old file from the source's current
+snapshot the moment it rewrites it, the source itself reads correctly (new
+file replaces old), but this tool's target kept referencing both -- the
+stale file was never revisited or removed, so every row it held became a
+permanent duplicate the moment its replacement got spliced in on a later
+run, and a genuinely-updated row ended up present with both its stale AND
+current values simultaneously, with nothing distinguishing which was
+current.
+
+**Reproduced live** with two minimal test connectors
+(`connectors/cow_test_01`/`cow_test_02`, 30 rows each, one table) before
+touching any code: baseline consolidation of 60 rows, clean. Re-synced
+`cow_test_01` with a connector that re-upserts one *existing* primary key
+with changed values instead of inserting a new one. Confirmed directly
+against the source's Iceberg snapshot that its original single file (30
+rows) was gone from the current snapshot, replaced by two new files (1 row
++ 29 rows = 30) -- real COW, not an insert. Re-running
+`register_consolidation.py` unchanged spliced both new files in as "never
+seen before," leaving 90 rows instead of 60: every one of `cow_test_01`'s
+30 rows duplicated (the file swap touched all of them, not just the
+changed one), and the one genuinely-updated row present twice --
+`(green, active, v1)` and `(orange, UPDATED, v2)` simultaneously.
+
+**The fix:** `already_registered_paths()` became
+`already_registered_by_source()`, returning the actual `DataFile` objects
+(not just path strings) grouped by which source they came from (via the
+partition value already recorded on every spliced entry). Each source's
+current file listing is now diffed both directions: new paths still splice
+in exactly as before, but any previously-registered path no longer present
+in that source's current snapshot is collected as orphaned and retired via
+`transaction.update_snapshot().overwrite()` -- `delete_data_file()` on each
+orphan, `append_data_file()` on its replacement(s), in one atomic commit.
+This is a public pyiceberg 0.11.1 API, not a private hack, and it mirrors
+Fivetran's own `OverwriteFiles` pattern exactly. Confirmed via the target's
+own snapshot history after the fix: the two prior splice commits recorded
+as `Operation.APPEND`; the retirement commit recorded as
+`Operation.OVERWRITE`, 1 file deleted -- exactly the swap that was missing
+before.
+
+**Re-ran the exact broken scenario after the fix, no config changes:**
+retired the 1 orphaned file, removed the 30 stale rows, table back to the
+correct 60, zero duplicates, the previously-updated widget now shows only
+its current value. A second run immediately after was a clean no-op (0
+spliced, 0 rewritten, 0 orphaned) -- idempotency holds under the new logic
+too.
+
+**Overhead, measured, not estimated:** a pure no-op run (nothing new,
+nothing orphaned) took 5.6s; the original splice-only baseline run took
+7.2s; the orphan-retirement run took 7.3s. Retiring an orphan costs about
+the same as a normal splice commit, not meaningfully more, and -- confirmed
+via the manifest count in the target's snapshot history -- it only rewrites
+the small manifest file(s) that actually contained a deleted entry, never
+the underlying Parquet data. **One real scaling caveat, not just a
+footnote:** a manifest batches many `DataFile` entries together (thousands,
+at production scale), and `_OverwriteFiles` rewrites the *whole* manifest
+if it contains even one orphaned entry -- so the cost of a retirement scales
+with the size of the manifest(s) the orphan happens to share, not with the
+number of orphaned files itself. Invisible at this test's scale (one file,
+one tiny manifest); worth re-measuring against a production-sized,
+frequently-updated source before assuming this stays cheap indefinitely.
+
+**Still not covered by this fix:** genuinely dropped rows where the source
+never re-adds a replacement (a real delete, not an update) are correctly
+retired the same way -- confirmed by the mechanism, not separately
+re-tested with a dedicated delete-only scenario in this pass. Renamed
+columns, dropped columns, and changed data types are still untouched by any
+of this and remain out of scope (see 1.0.0's "Explicitly out of scope"
+section, which is otherwise superseded by this entry on the merge-on-read
+question specifically).
+
 ## [1.0.0]
 
 Initial public-facing release, adapted from an internal R&D reference

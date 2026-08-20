@@ -109,7 +109,7 @@ schedule any batch job, e.g. after each source connection's sync completes.
 
 ## How it works, briefly
 
-Four steps, run per table, per registration pass:
+Five steps, run per table, per registration pass:
 
 1. **Reserve.** The target table's own bookkeeping column gets a field id
    from a permanently out-of-band range, so it can never collide with a
@@ -123,6 +123,12 @@ Four steps, run per table, per registration pass:
 4. **Rewrite (rare).** Only a genuine collision triggers an actual data
    rewrite, and only for the small number of newly-drifted rows involved,
    never a source's full history.
+5. **Retire orphaned files.** If a source's Managed Data Lake writer
+   copy-on-write-rewrites a file this tool already spliced in (see "What
+   this does NOT yet handle" below), the stale reference is detected and
+   removed from the target's manifest in the same commit as its
+   replacement gets spliced in -- a metadata-only operation, no Parquet
+   data read or rewritten.
 
 Full technical walkthrough, including the exact private pyiceberg mechanism
 this depends on and why it took three attempts to get right: see
@@ -146,17 +152,23 @@ running this against a source that has done any of them could produce
   already has files referencing a since-dropped source field is unknown.
 - **Changed data types**, even ostensibly-compatible promotions (e.g. `int`
   to `long`). Not tested against this pattern.
-- **Merge-on-read sources / delete files.** This tool only ever splices
-  `DataFileContent.DATA` entries. It has no logic for carrying forward
-  position-delete or equality-delete files. If a source's Iceberg writer
-  ever produces delete files (a common, cheap way to implement upserts),
-  splicing that source in **silently drops the delete and resurrects a
-  logically-deleted row** in the consolidated table, with zero errors
-  anywhere. Whether Fivetran's actual managed-lake writer represents
-  upserts this way for the connectors you're using was not checked as part
-  of building this tool -- confirm this for your own connectors before
-  running this against a source with row-level updates or deletes, not
-  just appends.
+- ~~Merge-on-read sources / delete files~~ **-- corrected, and now handled.**
+  This used to say Fivetran's writer might produce merge-on-read delete
+  files this tool couldn't carry forward. That was the wrong mechanism:
+  reading Fivetran's actual Managed Data Lake writer source confirms there
+  are no delete files anywhere in it -- `upsert()`/`update()`/`delete()` are
+  all pure **copy-on-write** (the writer rewrites whichever existing
+  physical file(s) could contain an affected primary key into brand-new
+  file(s), then atomically swaps old for new). The real risk this caused --
+  a source's row-level update or delete leaving a stale, duplicate file
+  behind in the target, silently duplicating unrelated rows and letting an
+  updated row's old and new values coexist -- was reproduced live and is
+  now fixed (step 5, "Retire orphaned files," above). See `CHANGELOG.md`'s
+  "Fixed: copy-on-write updates/deletes..." entry for the full
+  reproduction, the fix, and its measured overhead. What's still genuinely
+  untested: a pure delete with no replacement file at all (not an update) --
+  the retirement logic should handle it identically, but it wasn't
+  separately exercised as its own scenario.
 
 This is explicitly not a general-purpose ETL replacement, either: it's
 additive-column-safe, not transform-safe. If you need row-level
@@ -263,6 +275,25 @@ extension attached directly to the Polaris REST catalog instead of
 same cross-namespace spliced files (including the exact file that failed
 via `pyiceberg`) without issue, likely because it requests or receives a
 different credential scope than `pyiceberg`'s own vended-credentials path.
+
+**A row shows up twice with different values, or a source's row count in
+the consolidated table is higher than expected.** This was a real bug,
+fixed and reproduced live -- see `CHANGELOG.md`'s "Fixed: copy-on-write
+updates/deletes..." entry. If you're still seeing this on a version of this
+tool from before that fix: it happens when a source performs a genuine
+row-level UPDATE or DELETE (not just an insert), because Fivetran's writer
+handles those via copy-on-write -- it rewrites the whole physical file
+containing the changed row into a new file and retires the old one at the
+source. The old version of this tool only ever spliced in new files; it
+never checked whether a previously-spliced file had been retired at the
+source, so the stale file stayed in the target forever, duplicating every
+row it held (not just the changed one) against its replacement. Fixed by
+detecting files that disappear from a source's current snapshot and
+retiring them from the target's manifest in the same commit as their
+replacement -- update to the current version of `register_consolidation.py`
+and re-run; it will clean up any already-duplicated tables automatically
+(confirmed: a 90-row table with one real update dropped back to the correct
+60, zero duplicates, in the same run that detected the problem).
 
 **A downstream Snowflake-side Iceberg table on a consolidated table starts
 erroring after a rebuild.** If a consolidated table ever gets dropped and
