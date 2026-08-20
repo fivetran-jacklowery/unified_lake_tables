@@ -190,14 +190,55 @@ number of orphaned files itself. Invisible at this test's scale (one file,
 one tiny manifest); worth re-measuring against a production-sized,
 frequently-updated source before assuming this stays cheap indefinitely.
 
-**Still not covered by this fix:** genuinely dropped rows where the source
-never re-adds a replacement (a real delete, not an update) are correctly
-retired the same way -- confirmed by the mechanism, not separately
-re-tested with a dedicated delete-only scenario in this pass. Renamed
-columns, dropped columns, and changed data types are still untouched by any
-of this and remain out of scope (see 1.0.0's "Explicitly out of scope"
-section, which is otherwise superseded by this entry on the merge-on-read
-question specifically).
+**Follow-up: full insert/update/delete lifecycle, two independent cycles,
+both test sources.** The gap noted above -- a genuine delete, not just an
+update, wasn't separately exercised -- is now closed, with a real finding
+along the way: **Fivetran's Managed Data Lake destination soft-deletes.**
+`op.delete()` from a connector does not physically remove a row -- a
+`_fivetran_deleted` BOOLEAN column is added to every table automatically
+(not declared by any connector's own `schema()`), and a "deleted" row stays
+physically present in the current snapshot, just flagged `true`. Confirmed
+directly: querying the two rows explicitly deleted in testing showed both
+still present, with their original `color`/`status`/`version` values
+untouched, `_fivetran_deleted = true`. Mechanically, this means a delete on
+this destination type is **identical to an update** -- the same
+copy-on-write rewrite of the file containing that row, just flipping one
+column instead of several -- so there is no separate "orphan with zero
+replacement" scenario to worry about on MDLS specifically; the retirement
+logic above already covers it without any changes.
+
+Extended `connectors/cow_test_01`/`cow_test_02` to do all three, for real,
+every sync after the historical load: 5 inserts (brand-new primary keys), 3
+updates (re-upsert existing primary keys with changed values), 2 deletes
+(`op.delete()` on other existing primary keys), reseeded per-cycle so the
+exact rows touched vary sync to sync. Ran two full cycles across both
+sources and re-ran `register_consolidation.py` after each:
+
+| Stage | Rows/source | Consolidated total | Files spliced | Orphans retired | Stale rows removed | Wall clock |
+|---|---|---|---|---|---|---|
+| Baseline (insert-only) | 30 | 60 | 2 | 0 | 0 | 7.2s |
+| Cycle 1 (insert+update+delete) | 35 | 70 | 2 | 3 | 60 | 11.1s |
+| Cycle 2 (insert+update+delete) | 40 | 80 | 2 | 2 | 70 | 9.4s |
+
+Verified independently via DuckDB after every stage, not just trusted from
+the script's own log: total row count matched exactly at each step (60 ->
+70 -> 80), zero duplicate `(source, widget_id)` pairs at any point, every
+updated row present exactly once with its latest value (never a stale
+pre-update duplicate sitting alongside it), and every soft-deleted row
+present exactly once with `_fivetran_deleted = true` (never duplicated,
+never silently resurrected back to `false`). The second cycle's clean
+result matters as much as the first: it confirms the detect-and-retire
+logic doesn't accumulate drift, leftover state, or degrade on repeated
+real-world-style churn -- it isn't a one-shot fix that only happens to work
+the first time. Overhead held steady across both cycles too (11.1s and
+9.4s against a 7.2s pure-splice baseline), consistent with the earlier
+single-update measurement -- retiring 2-3 files in one run still costs
+about the same as a normal splice commit at this scale.
+
+**Still genuinely out of scope:** renamed columns, dropped columns, and
+changed data types remain untouched by any of this (see 1.0.0's
+"Explicitly out of scope" section, which is otherwise superseded by this
+entry on the merge-on-read question specifically).
 
 ## [1.0.0]
 

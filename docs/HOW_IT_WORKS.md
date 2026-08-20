@@ -280,13 +280,45 @@ re-measured against a production-sized, frequently-updated source with
 large, merged manifests -- don't assume the 7.3s number above holds at
 that scale.
 
-**Still not separately exercised:** a genuine DELETE with no replacement
-file at all (as opposed to an UPDATE, which always produces a replacement).
-The retirement logic should handle a pure delete identically -- it doesn't
-require the deleted file to have a same-run replacement, only that it's
-gone from the source's current listing -- but this was confirmed by
-mechanism, not by running a dedicated delete-only reproduction the way the
-update case above was.
+**Follow-up: DELETE, and the full lifecycle, actually exercised.** Extended
+`connectors/cow_test_01`/`cow_test_02` to do real inserts, updates, AND
+deletes every sync (5 new primary keys, 3 re-upserted existing primary
+keys, 2 `op.delete()` calls on other existing primary keys, reseeded
+per-cycle). This surfaced a real, useful finding rather than confirming the
+assumption above: **Fivetran's Managed Data Lake destination soft-deletes.**
+`op.delete()` doesn't physically remove a row -- every table automatically
+gets a `_fivetran_deleted` BOOLEAN column (not something any connector's
+own `schema()` declares), and a "deleted" row stays physically present in
+the current snapshot with that flag set `true`, its other columns
+untouched. Confirmed directly: the two rows explicitly deleted in testing
+were still queryable afterward, original `color`/`status`/`version` intact,
+`_fivetran_deleted = true`. Mechanically that makes a delete on this
+destination type **identical to an update** -- same copy-on-write rewrite
+of the containing file, just flipping one column -- so there is no separate
+"orphan with zero replacement" scenario on MDLS to design for; the
+retirement logic above already covers it without modification.
+
+Ran two full insert+update+delete cycles across both test sources,
+re-running `register_consolidation.py` after each and verifying
+independently via DuckDB every time (not trusting the script's own log
+alone):
+
+| Stage | Rows/source | Consolidated total | Orphans retired | Stale rows removed | Wall clock |
+|---|---|---|---|---|---|
+| Baseline (insert-only) | 30 | 60 | 0 | 0 | 7.2s |
+| Cycle 1 (insert+update+delete) | 35 | 70 | 3 | 60 | 11.1s |
+| Cycle 2 (insert+update+delete) | 40 | 80 | 2 | 70 | 9.4s |
+
+Every stage checked out exactly: row totals matched (60 -> 70 -> 80), zero
+duplicate `(source, primary key)` pairs at any point, every updated row
+present exactly once with its latest value, every soft-deleted row present
+exactly once with `_fivetran_deleted = true` (never duplicated, never
+silently flipped back). The second cycle mattered as much as the first --
+it confirms the detect-and-retire logic doesn't accumulate drift or
+leftover state across repeated real-world-style churn, and overhead held
+steady (11.1s, 9.4s) against the 7.2s pure-splice baseline across both
+rounds, consistent with the single-update measurement earlier in this
+section.
 
 ### Idempotency
 
@@ -397,9 +429,12 @@ documented in this repo's CHANGELOG).
 
 See the README's "What this does NOT yet handle" section for the customer-facing
 version. In short: "a source adds a new nullable column" (steps 1-4) and "a
-source performs a row-level UPDATE, retiring the old file via copy-on-write"
-(step 5) were both validated against real infrastructure. Renamed columns,
-dropped columns, and changed data types are different Iceberg mechanisms
-entirely and remain out of scope for this tool as written. A pure DELETE
-(no replacement file) is expected to work via the same step 5 mechanism but
-wasn't separately exercised as its own reproduction -- see step 5 above.
+source performs a row-level INSERT, UPDATE, or DELETE, all handled via
+copy-on-write retirement" (step 5) have all been validated against real
+infrastructure, across two independent sync cycles, on two sources. Note
+that on Fivetran's Managed Data Lake destination specifically, DELETE turned
+out to be a soft-delete (a `_fivetran_deleted` flag flip via the same COW
+rewrite as an UPDATE, row physically retained) rather than a true
+no-replacement removal -- see step 5 above for the full finding. Renamed
+columns, dropped columns, and changed data types are different Iceberg
+mechanisms entirely and remain out of scope for this tool as written.

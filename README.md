@@ -165,10 +165,16 @@ running this against a source that has done any of them could produce
   updated row's old and new values coexist -- was reproduced live and is
   now fixed (step 5, "Retire orphaned files," above). See `CHANGELOG.md`'s
   "Fixed: copy-on-write updates/deletes..." entry for the full
-  reproduction, the fix, and its measured overhead. What's still genuinely
-  untested: a pure delete with no replacement file at all (not an update) --
-  the retirement logic should handle it identically, but it wasn't
-  separately exercised as its own scenario.
+  reproduction, the fix, and its measured overhead. Follow-up testing
+  covered inserts, updates, AND deletes together, over two independent sync
+  cycles -- and surfaced a real finding: Fivetran's Managed Data Lake
+  destination **soft-deletes**. `op.delete()` doesn't physically remove a
+  row; a `_fivetran_deleted` flag gets added automatically and flipped via
+  the same copy-on-write rewrite as an update, with the row's other columns
+  left intact. So there's no true "orphan with zero replacement" case on
+  this destination type -- delete is mechanically identical to update, and
+  the same fix covers both. See `CHANGELOG.md`'s follow-up entry for the
+  two-cycle results table.
 
 This is explicitly not a general-purpose ETL replacement, either: it's
 additive-column-safe, not transform-safe. If you need row-level
