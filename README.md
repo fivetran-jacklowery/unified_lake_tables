@@ -144,10 +144,41 @@ explicitly **not** handled, are a different Iceberg mechanism entirely, and
 running this against a source that has done any of them could produce
 **incorrect results** with no error raised:
 
-- **Renamed columns.** Iceberg tracks renames by field id under the hood,
-  but this tool's drift detection has no way to distinguish "this is a
-  rename of an existing field" from "this is a new field that happens to
-  reuse an id" -- it was never tested against this case.
+- **Renamed columns -- tested, and it's actually two different scenarios
+  with two different outcomes.** Reading Fivetran's real
+  `ManagedDataLakeSchemaMigrator.java` first (not assuming): a connector
+  can't cause a true Iceberg rename at all. If a connector just stops
+  emitting one column name and starts emitting another, that's plain
+  `addColumn()` under the hood -- a brand-new field id, no different from
+  any other new column. A **true** field-id-preserving rename only ever
+  fires from an explicit Fivetran dashboard `customName` edit
+  (`ColumnConfigPatch`), which no connector can trigger on its own. Both
+  were reproduced against real infrastructure:
+  - **Connector-driven "rename" (stop emitting A, start emitting B).**
+    Confirmed to behave exactly like any other new column -- BUT testing it
+    surfaced an unrelated, more serious bug: this tool's schema-drift
+    baseline used to be borrowed from `source_namespaces[0]`'s *live*
+    schema, so a column that source gained by the time consolidation ran
+    was silently absorbed into "already expected" and never widened into
+    the target -- permanently, not just on the first run. Fixed by sourcing
+    the baseline from the *target's own* current schema instead. See
+    `CHANGELOG.md`'s "Fixed: a source's own schema evolution could vanish
+    into a stale baseline" entry for the reproduction, fix, and the
+    zero-rewrite recovery of the data that had already gone missing.
+  - **True dashboard-level rename (field id preserved).** Reproduced by
+    calling `update_schema().rename_column()` directly against one source
+    (simulating a `customName` patch) while leaving a second, otherwise
+    identical source untouched as a control. Result: consolidation runs as
+    a completely clean no-op, and the consolidated table keeps serving the
+    **old** column name forever, with no error, warning, or drift log line
+    of any kind -- even though the renamed source's own schema has already
+    moved on. The underlying data is never touched or corrupted (confirmed
+    by re-reading it directly), it's purely a stale label in the
+    consolidated view. **This one is not fixed.** It's a real, currently
+    open gap: nothing in this tool's per-file drift scan ever re-checks a
+    field id's *name* once that id is already known, so there's no hook
+    that could notice a rename happened. See `CHANGELOG.md`'s matching
+    entry if you're considering fixing this yourself.
 - **Dropped columns.** Not tested. Behavior against a target table that
   already has files referencing a since-dropped source field is unknown.
 - **Changed data types**, even ostensibly-compatible promotions (e.g. `int`
@@ -241,6 +272,21 @@ small cost. Nothing is lost, but if you're seeing this repeatedly for the
 same source across runs, that source's schema is drifting more than this
 tool's cost model assumes -- worth a closer look, and the run's summary
 output flags this explicitly.
+
+**A column the source has now shows up under a different name than in the
+consolidated table, but the data is otherwise correct.** This means a true
+Iceberg-level rename happened at the source (almost always a Fivetran
+dashboard `customName` edit, since a connector can't cause this on its
+own -- see "What this does NOT yet handle" above). This tool has no way to
+detect it: field ids are the only thing it tracks per column, and a rename
+preserves the field id by definition, so nothing ever looks "new." Not a
+bug you can `verify_consolidation.py` your way out of -- it's a genuine
+gap in what this tool watches for. The data itself is never at risk (it's
+the same field id, same bytes, just an old label), but if you need the
+consolidated view's column names to track a source's renames, this needs a
+real fix (likely: re-check every known field id's current name against
+every source on each run, not just newly-drifted ones) before you can rely
+on it for that.
 
 **Everything works except reading actual data (`SELECT COUNT(*)` succeeds
 but a real query fails on a file path, e.g. `AWS Error ACCESS_DENIED during

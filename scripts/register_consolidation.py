@@ -353,22 +353,41 @@ def create_target_table(cat: RestCatalog, target_id: str, source_schema: Schema,
     return cat.load_table(target_id)
 
 
-def file_has_drift_beyond(f, baseline_max_field_id: int):
+def file_has_drift_beyond(f, known_field_ids: set):
     """Return the field id of genuine schema drift in this file, or None.
 
     Compares null_value_counts (per field id) against record_count, not just
     whether a field id appears as a key in the file's stats at all. Iceberg
     backfills a stats entry for every field in a table's CURRENT schema onto
     every file, including files written before that field existed, so key
-    presence alone produces false positives on old files. A field id beyond
-    the source's recorded baseline that has fewer nulls than the file has
-    records means that file genuinely carries non-null data for a column
-    the baseline schema didn't have.
+    presence alone produces false positives on old files. A field id the
+    TARGET doesn't already know about, with fewer nulls than the file has
+    records, means that file genuinely carries non-null data for a column
+    the target's registered schema didn't have.
+
+    known_field_ids MUST be sourced from the TARGET table's own current
+    schema, never from any one source's schema. Field ids are assigned
+    independently per source table in this project's design -- that's
+    exactly why the collision-handling logic in register_table() exists at
+    all (two sources landing on the same field id with different meanings) --
+    so a source's own field-id numbering can't be trusted as "the baseline"
+    either. This function used to take an integer threshold
+    (baseline_max_field_id) borrowed from source_namespaces[0]'s live schema
+    instead of a set from the target: any field id already present in that
+    ONE source's current schema silently counted as "already known," even if
+    that source had only just gained it moments earlier in the very sync
+    being consolidated. See CHANGELOG.md's "Fixed: a source's own schema
+    evolution could vanish into a stale baseline" entry for the live
+    reproduction (a new column added by source_namespaces[0] itself never
+    got detected as drift, so it never got widened into the target -- not a
+    one-time miss, either: since the threshold was re-derived from that same
+    source's now-already-evolved schema on every subsequent run, it stayed
+    permanently invisible).
     """
     if not f.null_value_counts:
         return None
     for field_id, null_count in f.null_value_counts.items():
-        if field_id > baseline_max_field_id and null_count < f.record_count:
+        if field_id not in known_field_ids and null_count < f.record_count:
             return field_id
     return None
 
@@ -445,7 +464,6 @@ def register_table(table_name: str, cfg: dict) -> tuple:
 
     src0 = cat.load_table(f"{source_namespaces[0]}.{table_name}")
     source_schema = src0.schema()
-    baseline_max_field_id = max(f.field_id for f in source_schema.fields)
 
     target_id = f"{target_namespace}.{table_name}"
     ensure_namespace(cat, target_namespace)
@@ -457,6 +475,13 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         actual_id = target_table.schema().find_field(source_id_column).field_id
         logger.info("  [%s] created target table, %s field_id=%d", table_name, source_id_column, actual_id)
         assert actual_id == RESERVED_FIELD_ID_BASE
+
+    # The reference frame for "has any source drifted?" MUST be the target's
+    # OWN current schema, not source_namespaces[0]'s -- see
+    # file_has_drift_beyond()'s docstring for why borrowing one source's
+    # live schema as a stand-in baseline silently swallows that same
+    # source's own future schema changes.
+    known_field_ids = {f.field_id for f in target_table.schema().fields}
 
     already_by_source = already_registered_by_source(target_table)
     already = {p for paths in already_by_source.values() for p in paths}
@@ -473,7 +498,7 @@ def register_table(table_name: str, cfg: dict) -> tuple:
     for ns, (src_schema, files) in files_by_source.items():
         for task in files:
             f = task.file
-            drift_field = file_has_drift_beyond(f, baseline_max_field_id)
+            drift_field = file_has_drift_beyond(f, known_field_ids)
             if drift_field is not None:
                 field = src_schema.find_field(drift_field)
                 drift_by_field_id.setdefault(drift_field, [])
@@ -542,7 +567,7 @@ def register_table(table_name: str, cfg: dict) -> tuple:
             if f.file_path in already:
                 files_skipped_already += 1
                 continue
-            drift_field = file_has_drift_beyond(f, baseline_max_field_id)
+            drift_field = file_has_drift_beyond(f, known_field_ids)
             if drift_field is not None and ns in needs_rewrite_sources_by_field.get(drift_field, set()):
                 files_skipped_rewrite += 1
                 continue
@@ -633,7 +658,7 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         to_rewrite = [
             task.file
             for task in files
-            if task.file.file_path not in already and file_has_drift_beyond(task.file, baseline_max_field_id) == field_id
+            if task.file.file_path not in already and file_has_drift_beyond(task.file, known_field_ids) == field_id
         ]
         if not to_rewrite:
             continue

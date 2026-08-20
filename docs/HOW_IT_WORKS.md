@@ -122,15 +122,29 @@ top dependency risk of this whole technique -- see [apache/iceberg-python#1284
 ### 2. Splice (the no-rewrite path)
 
 For every file in every source table, `file_has_drift_beyond()` checks
-whether that file carries data for any field id beyond the source's recorded
-schema baseline. The check compares `null_value_counts` (per field id)
+whether that file carries data for any field id the **target** doesn't
+already know about (`known_field_ids`, a set built from the target table's
+own current schema). The check compares `null_value_counts` (per field id)
 against `record_count` -- **not** whether a field id merely appears as a key
 in the file's stats. Iceberg backfills a stats entry for every field in a
 table's *current* schema onto every file, including files written before
 that field existed, so key presence alone produces false positives on old
-files. A field id beyond baseline with fewer nulls than the file has records
-means that file genuinely carries non-null data Iceberg's own schema
-evolution added after the file was written.
+files. A field id the target doesn't know about, with fewer nulls than the
+file has records, means that file genuinely carries non-null data Iceberg's
+own schema evolution added after the file was written.
+
+**This used to be an integer threshold, not a set, and it was wrong in a
+way that stayed hidden until it wasn't.** The original version compared
+each field id against a single `baseline_max_field_id`, computed once per
+run from `source_namespaces[0]`'s (the first-listed source's) *live*
+schema -- effectively using one source as a stand-in for "the expected
+schema." That assumption breaks the moment that specific source gains a
+new column of its own: the new field id is already part of its live schema
+by the time this tool looks, so it's silently absorbed into "baseline"
+and never flagged as drift, ever, on any future run either. See
+`CHANGELOG.md`'s "Fixed: a source's own schema evolution could vanish into
+a stale baseline" entry for the live reproduction and the fix (swap the
+integer threshold for a set sourced from the target's own schema instead).
 
 Files with no drift, or drift that resolves to a field id the target
 already understands (see step 3), get spliced straight in: a `DataFile`
@@ -320,6 +334,63 @@ steady (11.1s, 9.4s) against the 7.2s pure-splice baseline across both
 rounds, consistent with the single-update measurement earlier in this
 section.
 
+### 6. Renamed columns: two scenarios, one fixed, one still open
+
+"Renamed columns" turned out not to be one thing. Reading Fivetran's
+`ManagedDataLakeSchemaMigrator.java` first (not assuming) settled which
+scenarios are even possible: a connector cannot cause a true, field-id-
+preserving Iceberg rename on its own. There's no name-similarity or
+rename-inference logic anywhere in Fivetran's migration-step planner --
+`renameColumn()` (which genuinely preserves the field id) only ever fires
+from an explicit dashboard `customName` edit (`ColumnConfigPatch`), gated
+behind a feature flag, with no path from a connector's own schema to that
+code. So there are exactly two distinct scenarios worth testing, and they
+were tested separately.
+
+**Scenario A: a connector stops emitting one column name, starts emitting
+another.** Mechanically this is `addColumn()` with a brand-new field id --
+identical to any other new-column case steps 2-4 already handle. Tested by
+extending `cow_test_01`/`cow_test_02` to switch from emitting `color` to
+emitting `hue` starting on their 3rd post-historical sync cycle, including
+on rows being inserted or updated in that same cycle (stacking this on top
+of the copy-on-write path from step 5). This is exactly the scenario that
+surfaced the `baseline_max_field_id` bug described in step 2 above -- both
+test sources gained `hue`, including `source_namespaces[0]`, which is
+precisely the condition that bug required. After the fix: log showed
+`widening (no-rewrite): 'hue' at physical field_id=8`, target schema
+updated immediately, and the data that had already been spliced in (but
+was invisible under the old logic) became queryable with zero re-splice
+and zero rewrite -- pure schema-evolution metadata, recovered for free.
+
+**Scenario B: a true, field-id-preserving rename of an existing column.**
+Simulated directly, since no connector can trigger this: called
+`table.update_schema().rename_column("status", "state")` against
+`cow_test_01.widgets` only (confirming the field id was preserved across
+the call, 3 before and after), leaving `cow_test_02` untouched as a
+control. Result: `register_consolidation.py` ran as a completely clean
+no-op -- 0 files spliced, 0 drift detected, nothing logged. The target's
+schema still shows `status` for field id 3, matching the untouched
+`cow_test_02` control, while `cow_test_01`'s own current schema now says
+`state` for that same id. No data was touched (confirmed by re-reading
+`cow_test_01`'s rows directly afterward) -- purely a stale label in the
+consolidated view, persisting silently for as long as this tool runs
+unmodified.
+
+**Why scenario B isn't fixed:** every mechanism in this tool -- drift
+detection, the splice path, the orphan-retirement path -- operates on
+`known_field_ids`, a set of field ids the target already knows about. Once
+an id is in that set, nothing ever re-checks whether its *name* still
+matches what any source currently calls it, because a rename touches zero
+data files: no new file appears, nothing gets orphaned, so there's no
+event for the existing per-file drift scan to notice in the first place.
+Fixing this would mean adding an entirely separate check -- re-resolving
+every already-known field id's current name against every source's live
+schema on every run, not just resolving newly-drifted ids -- which is a
+different, larger piece of work than the step-2 fix and was not
+undertaken here. Left as an explicit, documented gap (see README.md's
+"What this does NOT yet handle" and Troubleshooting sections) rather than
+silently treated as covered.
+
 ### Idempotency
 
 Re-running `register_consolidation.py` against sources with nothing new
@@ -435,6 +506,14 @@ infrastructure, across two independent sync cycles, on two sources. Note
 that on Fivetran's Managed Data Lake destination specifically, DELETE turned
 out to be a soft-delete (a `_fivetran_deleted` flag flip via the same COW
 rewrite as an UPDATE, row physically retained) rather than a true
-no-replacement removal -- see step 5 above for the full finding. Renamed
-columns, dropped columns, and changed data types are different Iceberg
+no-replacement removal -- see step 5 above for the full finding.
+
+Renamed columns are no longer entirely out of scope -- see step 6 above.
+A connector switching which column name it emits is validated (it's the
+same add-column mechanism as steps 1-4, and testing it surfaced and fixed
+a real, previously-invisible bug in how this tool computed schema drift).
+A true, field-id-preserving rename -- the kind only a Fivetran dashboard
+`customName` edit can cause -- was tested and confirmed to silently go
+stale in the consolidated view, with no error or warning, and is a known,
+unfixed gap. Dropped columns and changed data types are different Iceberg
 mechanisms entirely and remain out of scope for this tool as written.

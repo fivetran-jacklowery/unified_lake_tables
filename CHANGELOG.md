@@ -235,10 +235,118 @@ the first time. Overhead held steady across both cycles too (11.1s and
 single-update measurement -- retiring 2-3 files in one run still costs
 about the same as a normal splice commit at this scale.
 
-**Still genuinely out of scope:** renamed columns, dropped columns, and
-changed data types remain untouched by any of this (see 1.0.0's
-"Explicitly out of scope" section, which is otherwise superseded by this
-entry on the merge-on-read question specifically).
+**Still genuinely out of scope:** dropped columns and changed data types
+remain untouched by any of this (see 1.0.0's "Explicitly out of scope"
+section, which is otherwise superseded by this entry on the merge-on-read
+question specifically). Renamed columns are no longer untested -- see the
+next entry.
+
+### Fixed: a source's own schema evolution could vanish into a stale baseline
+
+Found while testing renamed columns -- specifically, the case where a
+connector stops emitting one column name and starts emitting another (e.g.
+`color` -> `hue`). First confirmed, by reading
+`ManagedDataLakeSchemaMigrator.java`, that this isn't a real Iceberg rename
+at all: there's no name-similarity inference anywhere in Fivetran's
+migration-step planner, so a new column name from a connector is always
+plain `addColumn()` with a brand-new field id, mechanically identical to
+any other new-column case this tool already handles. A true
+field-id-preserving rename only ever fires from an explicit dashboard
+`customName` edit, which no connector can trigger -- see the next entry for
+that case tested separately.
+
+Extended `connectors/cow_test_01`/`cow_test_02` (both already carrying
+`color`) to switch to emitting `hue` instead starting on their 3rd
+post-historical sync cycle, including on rows being inserted or updated in
+that same cycle (stacking the "rename" on top of the copy-on-write path
+already validated above). Deployed, synced, and re-ran
+`register_consolidation.py` -- expecting a normal widen, exactly like any
+other new column.
+
+**What actually happened:** `hue` never showed up in the target's schema
+at all. Not a delay -- confirmed via direct schema inspection (both
+sources had `hue` at field id 8; the target capped out at field id 7) and
+by re-running consolidation a second time with zero source changes: still
+missing, still a clean no-op with nothing to widen. Genuinely stuck, not
+just slow.
+
+**Root cause:** `register_table()` computed a `baseline_max_field_id`
+(a single integer) fresh on every run from `source_namespaces[0]`'s (the
+first-listed source's) *live* schema, and treated any field id at or below
+that number as "already expected" -- never drift. By the time
+consolidation ran, Fivetran had already evolved `cow_test_01`'s own schema
+to include `hue`, so the baseline was already 8 before the drift check
+ever looked at a single file. Every subsequent run re-derived the same
+already-evolved baseline from the same source, so this wasn't a one-time
+miss -- it was permanent, for as long as that config existed. This has
+nothing specifically to do with renames: it's a blind spot for *any*
+column `source_namespaces[0]` gains, for any reason, the moment it gains
+it before the very first consolidation run that could have seen it as
+new. Every earlier add-column test in this project happened to land the
+new column on a source other than the first-listed one, which is exactly
+why this was never caught before.
+
+**The fix:** `baseline_max_field_id` (an int threshold, borrowed from one
+source) became `known_field_ids` (a set, sourced from the *target* table's
+own current schema, computed once per run right after the target is
+loaded or created). `file_has_drift_beyond()`'s check changed from `field_id
+> baseline_max_field_id` to `field_id not in known_field_ids`. The target's
+own schema is the only thing that actually defines "what does this tool
+already know about" -- borrowing any one source's schema as a stand-in
+never made sense once you remember that source field ids are independently
+numbered per table (the exact reason the field-id-collision logic already
+existed). Every call site (drift scan, splice-skip check, rewrite-pass
+matching) took the same value, so this was a one-definition change, not a
+scattered patch.
+
+**Re-ran the exact broken scenario after the fix, no other changes:** log
+showed `widening (no-rewrite): 'hue' at physical field_id=8`, and the
+target's schema immediately included `hue`. This recovered the data that
+had already been stuck -- for free. The files carrying `hue` values were
+already spliced into the target's manifest from the earlier broken run;
+widening the schema to declare field id 8 made that already-present data
+queryable immediately, with zero re-splice and zero rewrite, since Iceberg
+schema evolution is purely additive metadata. A follow-up run was a clean
+idempotent no-op (0 spliced, 0 rewritten, 0 orphaned).
+
+**Overhead:** effectively free. `known_field_ids` is built from
+`target_table.schema().fields`, metadata already sitting in memory from a
+table load this code already performs every run -- no added network round
+trip, no added file read. The recovery itself cost one small
+schema-evolution call, not a rewrite.
+
+### Confirmed, not fixed: a true (dashboard-level) rename goes stale silently
+
+Tested the other rename scenario the fix above doesn't touch: an existing
+field genuinely renamed with its field id preserved -- what a Fivetran
+dashboard `customName` edit does, and the only way a true Iceberg rename
+can happen on this destination at all. Simulated directly (no dashboard
+access from this test harness) by calling
+`table.update_schema().rename_column("status", "state")` against
+`cow_test_01.widgets` only, leaving `cow_test_02` untouched as a control.
+Confirmed the field id was preserved across the call (`field_id=3` before
+and after, name only) before treating this as a valid simulation of the
+real mechanism.
+
+**Result:** `register_consolidation.py` ran as a completely clean no-op --
+0 files spliced, 0 drift detected, no warning, no log line of any kind.
+The target's schema still shows `status` for field id 3 (matching the
+untouched `cow_test_02` control) while `cow_test_01`'s own current schema
+now says `state` for that same field id. Re-read the actual row data
+directly from `cow_test_01` afterward to confirm the rename didn't touch a
+single byte -- values were exactly as expected from prior test cycles.
+
+**Why this one isn't fixed:** this tool's only per-column signal is a
+field id's presence in `known_field_ids`; once an id is known, nothing
+ever re-checks whether its *name* still matches a source's current schema
+-- there's no hook that could notice, since a rename touches zero data
+files (no new file, no orphan, nothing for the per-file drift scan to see
+in the first place). A real fix would mean re-checking every already-known
+field id's current name against every source on every run, not just
+resolving newly-drifted ids -- a different, larger piece of work than the
+baseline fix above, and not undertaken here. Left as an open, clearly
+documented gap (see README.md's "What this does NOT yet handle" and
+Troubleshooting sections) rather than silently declared handled.
 
 ## [1.0.0]
 
