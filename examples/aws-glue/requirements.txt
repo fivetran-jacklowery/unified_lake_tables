@@ -1,0 +1,18 @@
+# Same pyiceberg/pyarrow pins as the repo root requirements.txt, plus the
+# "glue" extra (pulls in boto3) and boto3 pinned directly for the same
+# reason pyarrow is pinned directly in the root file: this script touches
+# boto3's Glue client and pyarrow's S3 filesystem closely enough that a
+# floating version isn't worth the risk.
+#
+# See the root requirements.txt's comment on why pyiceberg is pinned
+# exactly (the reserved-field-id trick depends on an undocumented private
+# attribute -- apache/iceberg-python#1284). That applies here too.
+pyiceberg[pyarrow,glue]==0.11.1
+
+pyarrow==25.0.0
+
+boto3==1.43.66
+
+PyYAML==6.0.3
+
+python-dotenv==1.0.1

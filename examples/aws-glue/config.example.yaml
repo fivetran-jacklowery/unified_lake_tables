@@ -1,0 +1,59 @@
+# Copy this file to config.yaml and edit it for your environment.
+# config.yaml (the real one, with your actual database names) is
+# gitignored -- it isn't secret in the way credentials are, but there's no
+# reason to commit account-specific object names either.
+#
+# Shape is identical to the Polaris original's config.yaml -- this tool's
+# config format doesn't know or care which catalog backend is underneath.
+
+# Database where the consolidated (target) tables get created. In Glue
+# terms this is a Glue database name. It does not need to exist yet --
+# the script creates it.
+target_namespace: consolidated
+
+# Every source database (Glue database = pyiceberg namespace) to fold into
+# the consolidated tables -- typically one per Fivetran connection, one per
+# tenant, or one per source database, depending on how your connectors are
+# set up.
+#
+# All source databases are expected to share the same table names and a
+# structurally compatible schema (same columns meaning the same thing).
+# See the repo root README's "What this does NOT yet handle" section
+# before running this against sources you aren't sure are structurally
+# identical.
+#
+# Set EXACTLY ONE of the two options below -- explicit list, or pattern.
+
+# Option A: explicit list.
+source_namespaces:
+  - postgres_shard_001
+  - postgres_shard_002
+  - postgres_shard_003
+  # ... add as many source databases as you have
+
+# Option B: a glob pattern instead of an explicit list -- comment out
+# source_namespaces above and uncomment this if you have dozens or
+# hundreds of source databases. Resolved against your Glue catalog's
+# ACTUAL databases at run time (list_namespaces()), not maintained as a
+# static list. Matching uses glob semantics (*, ?, [seq]), not SQL LIKE.
+# The resolved list is always logged at INFO level.
+#
+# source_namespace_pattern: "postgres_shard_*"
+
+# Name of the bookkeeping column added to every consolidated table. It
+# records which source database each row came from, and it's also the
+# identity-partition column, so filtering a query on this column is what
+# gets you real partition pruning.
+#
+# Pick a name that doesn't collide with any real column name already used
+# by your source tables.
+source_id_column: source_connection_id
+
+# --- Optional performance tuning below. Safe to omit; defaults shown. ---
+
+# How many target tables to register concurrently (top-level thread pool).
+table_workers: 8
+
+# How many source databases to read concurrently, per table, while
+# checking for new/drifted files.
+source_workers: 8
