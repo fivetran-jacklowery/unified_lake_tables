@@ -70,6 +70,8 @@ from pyiceberg.schema import Schema
 from pyiceberg.typedef import Record
 from pyiceberg.types import StringType
 
+from multi_source_io import MultiSourceFileIO
+
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(message)s",
@@ -668,10 +670,28 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         # file_path the way the no-rewrite path is. Check by row content
         # instead (does the target already have non-null values for this
         # source+field?).
-        already_rewritten = target_table.scan(
-            row_filter=f"{source_id_column} = '{ns}' and {name} is not null",
-            selected_fields=(name,),
-        ).to_arrow().num_rows
+        #
+        # This scan's row_filter restricts to source_id_column = ns, but the
+        # matching files (spliced in by reference in a prior run, per this
+        # tool's whole no-rewrite design) still physically live under NS's
+        # OWN storage location, not the target's -- and Polaris only ever
+        # vends the target table's credential scoped to the target's own
+        # location. Reading through target_table.io alone hits AWS
+        # ACCESS_DENIED here (reproduced live, see CHANGELOG.md's "Known
+        # issue: collision-rewrite path can hit ACCESS_DENIED under vended
+        # credentials"). Temporarily swap in a FileIO that also tries this
+        # source's own vended credential -- src_table.io -- before falling
+        # back to failure; restore the target's own IO immediately after so
+        # writes later in this function always go through its own credential.
+        original_io = target_table.io
+        target_table.io = MultiSourceFileIO([target_table.io, src_table.io])
+        try:
+            already_rewritten = target_table.scan(
+                row_filter=f"{source_id_column} = '{ns}' and {name} is not null",
+                selected_fields=(name,),
+            ).to_arrow().num_rows
+        finally:
+            target_table.io = original_io
         expected_rows = sum(f.record_count for f in to_rewrite)
         if already_rewritten >= expected_rows:
             logger.info(

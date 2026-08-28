@@ -291,42 +291,39 @@ on it for that.
 **Everything works except reading actual data (`SELECT COUNT(*)` succeeds
 but a real query fails on a file path, e.g. `AWS Error ACCESS_DENIED during
 HeadObject operation`).** This is a confirmed catalog-integration gotcha,
-not specific to this tool -- and not hypothetical: it was reproduced live
-during `source_namespace_pattern` testing, when `verify_consolidation.py`'s
-independent row-count check hit exactly this error reading a spliced-in
-file. A vended-credential catalog integration can fail to cover a table
-whose manifest points at files **outside its own default storage
-location** -- which is exactly what this tool does by design (the whole
-point is pointing a target table's manifest at a different table's files).
-If you hit this from a downstream engine (e.g. Snowflake) reading the
-consolidated table, or from `verify_consolidation.py` itself, check whether
-that engine's catalog integration needs a broader storage-location
-allowlist than a single table's default location -- this is not a bug in
-the registration logic, and re-running `register_consolidation.py` will not
-fix it.
+not specific to this tool -- and not hypothetical: it was originally
+reproduced live during `source_namespace_pattern` testing, when
+`verify_consolidation.py`'s independent row-count check hit exactly this
+error reading a spliced-in file. A vended-credential catalog integration
+can fail to cover a table whose manifest points at files **outside its own
+default storage location** -- which is exactly what this tool does by
+design (the whole point is pointing a target table's manifest at a
+different table's files). **`verify_consolidation.py`'s own row-count check
+is fixed** (see `CHANGELOG.md`'s "Fixed: the ACCESS_DENIED gap above, in
+the script itself" -- it now reads through the relevant source table's own
+vended credential when the target's doesn't cover a file). If you hit this
+from a **downstream engine** (e.g. Snowflake) reading the consolidated
+table directly, that's still a separate, open question -- check whether
+that engine's own catalog integration needs a broader storage-location
+allowlist than a single table's default location; that's not something
+this tool's scripts can fix from the outside.
 
-**`register_consolidation.py` itself can hit this same ACCESS_DENIED error
-during collision handling.** Reproduced live: running a real two-source
-field-id collision through the script, the no-rewrite splice and the
-free-widen step both completed and committed correctly, but the run then
-crashed inside step 4's own idempotency check (the `target_table.scan(...)`
-call that looks for rows already rewritten in a prior run), for the exact
-reason above -- by that point the target table's manifest already
-references files from every source namespace, and the vended credential
-only covers the target's own default storage location. This is a real,
-currently-unresolved gap in the collision-rewrite path specifically (see
-`CHANGELOG.md`'s "Known issue" entry for the full reproduction and root
-cause) -- **the script has not been changed to work around it yet.**
-Practically: the splice path (the overwhelming majority of what this tool
-does) is unaffected and commits fine regardless; only a genuine field-id
-collision's rewrite step is at risk of failing outright rather than
-resolving. If you need to independently verify or read across a
-consolidated table's full manifest in the meantime, use DuckDB's Iceberg
-extension attached directly to the Polaris REST catalog instead of
-`pyiceberg`'s own `RestCatalog` client -- confirmed live, DuckDB reads these
-same cross-namespace spliced files (including the exact file that failed
-via `pyiceberg`) without issue, likely because it requests or receives a
-different credential scope than `pyiceberg`'s own vended-credentials path.
+**`register_consolidation.py` used to be able to hit this same
+ACCESS_DENIED error during collision handling -- fixed.** Reproduced live:
+running a real two-source field-id collision through the script, the
+no-rewrite splice and the free-widen step both completed and committed
+correctly, but the run then crashed inside step 4's own idempotency check
+(the `target_table.scan(...)` call that looks for rows already rewritten in
+a prior run), for the exact reason above -- by that point the target
+table's manifest already references files from every source namespace, and
+the vended credential only covers the target's own default storage
+location. See `CHANGELOG.md`'s "Known issue" entry for the full original
+reproduction and root cause, and its "Fixed" follow-up entry for the fix
+(`scripts/multi_source_io.py`, a `FileIO` that falls back to a source
+table's own vended credential when the target's doesn't cover a file) --
+verified live by re-running against the exact collision that originally
+crashed, with no error, and a subsequent clean `verify_consolidation.py`
+pass across all tables.
 
 **A row shows up twice with different values, or a source's row count in
 the consolidated table is higher than expected.** This was a real bug,

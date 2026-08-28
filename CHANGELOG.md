@@ -110,6 +110,44 @@ in this tool directly. **Not yet changed in the script itself** -- this is
 documentation of a real, reproduced gap and a validated workaround, not a
 code fix.
 
+### Fixed: the ACCESS_DENIED gap above, in the script itself
+
+New `scripts/multi_source_io.py`: a `MultiSourceFileIO` that wraps a
+table's own `FileIO` alongside one or more other tables' `FileIO`
+instances (each carrying that table's own vended credential), and tries
+each in turn to open a given file -- caching which one worked per storage
+prefix so repeat opens of the same source's files don't retry every
+candidate. `Table.io` turned out to be a plain settable attribute
+(`self.io = io` in `pyiceberg.table.Table.__init__`, confirmed by reading
+the installed 0.10.0 source) that `Table.scan()` reads fresh on every call
+(`DataScan(..., io=self.io, ...)`), so both fixed call sites work by
+temporarily swapping `target_table.io` for a `MultiSourceFileIO` built from
+`[target_table.io, src_table.io]` around just the one scan that needs
+cross-namespace reads, then restoring the target's own IO immediately
+after -- writes always go through the target's own credential, unaffected.
+
+Applied to both places this same root cause showed up:
+`register_consolidation.py`'s collision-rewrite idempotency check (the
+exact crash reproduced above), and `verify_consolidation.py`'s per-source
+row-count check (the "same root cause... but [less severe]" instance this
+entry's own writeup pointed to).
+
+Verified live against the same sandbox catalog and the same `warehouses`
+collision that originally crashed: re-running `register_consolidation.py`
+completed the previously-pending rewrite (1 file, 50 rows) with no error,
+and a subsequent `verify_consolidation.py` run passed all checks (row
+counts, duplicate-file check, partition-pruning check) for all 15 tables,
+`warehouses` included (452,499 total rows across 8 sources, all matching
+source counts exactly). The `MultiSourceFileIO` fallback/caching logic was
+also unit-tested standalone against fake `FileIO`s simulating this exact
+failure mode before the live re-run.
+
+Note: this fixes the two call sites that actually hit the bug today. It is
+not a general "any reader can see any file in this catalog" credential
+model -- a future cross-namespace read added somewhere else would need the
+same treatment (wrap the relevant tables' `FileIO`s) rather than assuming
+this is fixed globally.
+
 ### Fixed: copy-on-write updates/deletes were silently duplicating and resurrecting rows
 
 Found via a piece of external feedback on this technique, then reproduced
