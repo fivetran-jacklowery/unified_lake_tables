@@ -355,7 +355,7 @@ def create_target_table(cat: RestCatalog, target_id: str, source_schema: Schema,
     return cat.load_table(target_id)
 
 
-def file_has_drift_beyond(f, known_field_ids: set):
+def file_has_drift_beyond(f, known_field_names: dict, src_schema):
     """Return the field id of genuine schema drift in this file, or None.
 
     Compares null_value_counts (per field id) against record_count, not just
@@ -367,29 +367,69 @@ def file_has_drift_beyond(f, known_field_ids: set):
     records, means that file genuinely carries non-null data for a column
     the target's registered schema didn't have.
 
-    known_field_ids MUST be sourced from the TARGET table's own current
-    schema, never from any one source's schema. Field ids are assigned
-    independently per source table in this project's design -- that's
-    exactly why the collision-handling logic in register_table() exists at
-    all (two sources landing on the same field id with different meanings) --
-    so a source's own field-id numbering can't be trusted as "the baseline"
-    either. This function used to take an integer threshold
-    (baseline_max_field_id) borrowed from source_namespaces[0]'s live schema
-    instead of a set from the target: any field id already present in that
-    ONE source's current schema silently counted as "already known," even if
-    that source had only just gained it moments earlier in the very sync
-    being consolidated. See CHANGELOG.md's "Fixed: a source's own schema
-    evolution could vanish into a stale baseline" entry for the live
-    reproduction (a new column added by source_namespaces[0] itself never
-    got detected as drift, so it never got widened into the target -- not a
-    one-time miss, either: since the threshold was re-derived from that same
-    source's now-already-evolved schema on every subsequent run, it stayed
-    permanently invisible).
+    known_field_names MUST be sourced from the TARGET table's own current
+    schema (a {field_id: name} dict), never from any one source's schema.
+    Field ids are assigned independently per source table in this project's
+    design -- that's exactly why the collision-handling logic in
+    register_table() exists at all (two sources landing on the same field id
+    with different meanings) -- so a source's own field-id numbering can't be
+    trusted as "the baseline" either. This function used to take an integer
+    threshold (baseline_max_field_id) borrowed from source_namespaces[0]'s
+    live schema instead of a set from the target: any field id already
+    present in that ONE source's current schema silently counted as "already
+    known," even if that source had only just gained it moments earlier in
+    the very sync being consolidated. See CHANGELOG.md's "Fixed: a source's
+    own schema evolution could vanish into a stale baseline" entry for the
+    live reproduction (a new column added by source_namespaces[0] itself
+    never got detected as drift, so it never got widened into the target --
+    not a one-time miss, either: since the threshold was re-derived from
+    that same source's now-already-evolved schema on every subsequent run,
+    it stayed permanently invisible).
+
+    CRITICAL, confirmed-by-reproduction fix: knowing a field id ISN'T THE
+    SAME as that id's collision (if any) actually being resolved for THIS
+    source. A field id being present in known_field_names only means SOME
+    source's name for it has been registered -- it says nothing about
+    whether THIS file's own source agrees that's what the id means. Two
+    ways this bit us for real, both against the identical live data (see
+    CHANGELOG.md "Fixed: silent field-id collision misattribution"):
+
+      1. Day one, no interruption needed at all: create_target_table() seeds
+         the target's starting schema from source_namespaces[0]'s full
+         schema, so every field id source #1 already happens to use is
+         "known" from the moment the target table is created -- before this
+         function is ever called for any OTHER source's files. A second
+         source landing a differently-named column on that same numeric id
+         (which independently-evolving sources do routinely, since each
+         starts counting from its own schema's next free id) was never
+         flagged as drift and got silently spliced in under source #1's
+         name for that id.
+      2. An interrupted collision-rewrite: the "owner" name for a colliding
+         id is committed as soon as the collision is FIRST detected (see the
+         widening step in register_table()), independently of whether the
+         LOSING source's rewrite (a separate, later commit) ever completes.
+         If that rewrite is interrupted, a rerun sees the id as "known" from
+         the owner's already-committed widening and never re-flags the
+         loser's still-unresolved file, even though that file's rewrite
+         never actually happened.
+
+    Both are the same underlying mistake: treating "is this id known" as
+    equivalent to "is this id known to mean what THIS source thinks it
+    means." The fix is to also compare THIS source's own name for the field
+    id (from src_schema, that source's live schema) against the target's
+    registered name for it -- a mismatch is still-unresolved drift,
+    regardless of whether the id itself is otherwise "known."
     """
     if not f.null_value_counts:
         return None
     for field_id, null_count in f.null_value_counts.items():
-        if field_id not in known_field_ids and null_count < f.record_count:
+        if null_count >= f.record_count:
+            continue
+        target_name = known_field_names.get(field_id)
+        if target_name is None:
+            return field_id
+        src_field = src_schema.find_field(field_id) if src_schema else None
+        if src_field is not None and src_field.name != target_name:
             return field_id
     return None
 
@@ -428,16 +468,37 @@ def already_registered_by_source(target_table) -> dict:
          lets the caller pass an orphaned entry straight to
          _OverwriteFiles.delete_data_file() -- that call needs the actual
          DataFile, not its path.
+
+    Returns a (by_source, spliced_by_source) pair. by_source is every
+    registered file, used for the plain "already registered, don't
+    re-splice" idempotency check. spliced_by_source is the subset actually
+    eligible for copy-on-write orphan detection: only files spliced in BY
+    REFERENCE still physically live at the SOURCE's own storage location,
+    so only those can be meaningfully compared against "does this path
+    still appear in the source's current file listing." A file created by
+    the collision-rewrite path (register_table()'s step 4, via
+    Transaction.append()) is a brand-new physical file written under the
+    TARGET's own storage location -- it will never appear in any source's
+    own file listing, by construction, regardless of whether anything is
+    wrong with it. Treating it as orphan-eligible anyway was a real,
+    reproduced bug: every such file got deleted and re-derived on every
+    subsequent run, since "not in the source's current files" was always
+    true for it. See CHANGELOG.md "Fixed: rewrite-path files were
+    perpetually treated as copy-on-write orphans".
     """
     by_source = {}
+    spliced_by_source = {}
+    target_location = target_table.metadata.location
     try:
         for task in target_table.scan().plan_files():
             f = task.file
             src = f.partition[0]
             by_source.setdefault(src, {})[f.file_path] = f
+            if not f.file_path.startswith(target_location):
+                spliced_by_source.setdefault(src, {})[f.file_path] = f
     except Exception:
         pass
-    return by_source
+    return by_source, spliced_by_source
 
 
 def _load_source_files(source_namespace: str, table_name: str):
@@ -482,10 +543,13 @@ def register_table(table_name: str, cfg: dict) -> tuple:
     # OWN current schema, not source_namespaces[0]'s -- see
     # file_has_drift_beyond()'s docstring for why borrowing one source's
     # live schema as a stand-in baseline silently swallows that same
-    # source's own future schema changes.
-    known_field_ids = {f.field_id for f in target_table.schema().fields}
+    # source's own future schema changes. Keyed by name (not just a set of
+    # ids) so drift-detection can tell "known and this source agrees what
+    # it means" apart from "known, but only because a DIFFERENT source's
+    # name for it won" -- see file_has_drift_beyond()'s docstring.
+    known_field_names = {f.field_id: f.name for f in target_table.schema().fields}
 
-    already_by_source = already_registered_by_source(target_table)
+    already_by_source, spliced_by_source = already_registered_by_source(target_table)
     already = {p for paths in already_by_source.values() for p in paths}
 
     # 1. Detect every source's drifted files, in parallel across sources.
@@ -500,7 +564,7 @@ def register_table(table_name: str, cfg: dict) -> tuple:
     for ns, (src_schema, files) in files_by_source.items():
         for task in files:
             f = task.file
-            drift_field = file_has_drift_beyond(f, known_field_ids)
+            drift_field = file_has_drift_beyond(f, known_field_names, src_schema)
             if drift_field is not None:
                 field = src_schema.find_field(drift_field)
                 drift_by_field_id.setdefault(drift_field, [])
@@ -512,24 +576,49 @@ def register_table(table_name: str, cfg: dict) -> tuple:
     #    physical id (no-rewrite widen); any OTHER distinct name sharing
     #    that same physical id is a genuine collision -> fresh id + real
     #    rewrite for just its drifted rows.
+    #
+    #    IMPORTANT: "first distinct name seen" only gets to become the
+    #    no-rewrite owner if the target doesn't ALREADY have a registered
+    #    name for this physical field id. The target's schema starts out
+    #    seeded from source_namespaces[0]'s full schema at creation (see
+    #    create_target_table()), so a field id can already mean something
+    #    to the target on the very first run this collision is even
+    #    noticed -- before any widening this function does. Trying to widen
+    #    onto an id the target already uses for a DIFFERENT name isn't a
+    #    free no-rewrite claim, it's a genuine conflict, and Polaris
+    #    correctly rejects it (HTTP 400: duplicate field id) rather than
+    #    silently overwriting what that id already means. Reproduced live
+    #    while validating the file_has_drift_beyond() fix above -- see
+    #    CHANGELOG.md "Fixed: silent field-id collision misattribution".
+    #    When the target already has a name for this id, that name is the
+    #    true owner outright, and EVERY distinct name seen this run is a
+    #    loser needing the rewrite path -- none of them get a free widen.
     rewrite_needed = []
     for field_id, entries in drift_by_field_id.items():
         distinct_names = {}
         for ns, name, ftype in entries:
             distinct_names.setdefault(name, []).append(ns)
         names_in_order = list(distinct_names.keys())
-        owner_name = names_in_order[0]
-        owner_type = next(ft for s, n, ft in entries if n == owner_name)
-        already_field_names = {f.name: f.field_id for f in target_table.schema().fields}
-        if owner_name not in already_field_names:
-            logger.info(
-                "  [%s] widening (no-rewrite): '%s' at physical field_id=%d", table_name, owner_name, field_id
-            )
-            with target_table.update_schema() as us:
-                us._last_column_id = itertools.count(field_id)
-                us.add_column(owner_name, owner_type)
-            target_table = cat.load_table(target_id)
-        for other_name in names_in_order[1:]:
+
+        existing_name_for_id = known_field_names.get(field_id)
+        if existing_name_for_id is not None:
+            owner_name = existing_name_for_id
+            losers = names_in_order
+        else:
+            owner_name = names_in_order[0]
+            owner_type = next(ft for s, n, ft in entries if n == owner_name)
+            already_field_names = {f.name: f.field_id for f in target_table.schema().fields}
+            if owner_name not in already_field_names:
+                logger.info(
+                    "  [%s] widening (no-rewrite): '%s' at physical field_id=%d", table_name, owner_name, field_id
+                )
+                with target_table.update_schema() as us:
+                    us._last_column_id = itertools.count(field_id)
+                    us.add_column(owner_name, owner_type)
+                target_table = cat.load_table(target_id)
+            losers = names_in_order[1:]
+
+        for other_name in losers:
             for ns in distinct_names[other_name]:
                 other_type = next(ft for s, n, ft in entries if n == other_name and s == ns)
                 rewrite_needed.append((ns, field_id, other_name, other_type))
@@ -559,9 +648,20 @@ def register_table(table_name: str, cfg: dict) -> tuple:
     total_new_rows = 0
     total_orphaned_rows = 0
     for ns in source_namespaces:
-        _, files = files_by_source[ns]
+        src_schema, files = files_by_source[ns]
         current_paths_this_source = {task.file.file_path for task in files}
-        registered_this_source = already_by_source.get(ns, {})
+        # Orphan-eligible files ONLY -- spliced_by_source excludes anything
+        # written by the collision-rewrite path (step 4's Transaction.append()
+        # calls), since those files physically live under the TARGET's own
+        # storage location and will never appear in current_paths_this_source
+        # regardless of whether anything is wrong with them. Using the full
+        # already_by_source here instead was a real, reproduced bug: every
+        # rewritten/appended file got treated as orphaned and deleted+
+        # re-derived on every subsequent run. See
+        # already_registered_by_source()'s docstring and CHANGELOG.md
+        # "Fixed: rewrite-path files were perpetually treated as
+        # copy-on-write orphans".
+        registered_this_source = spliced_by_source.get(ns, {})
 
         files_ok, rows_this_source, files_skipped_already, files_skipped_rewrite = 0, 0, 0, 0
         for task in files:
@@ -569,7 +669,7 @@ def register_table(table_name: str, cfg: dict) -> tuple:
             if f.file_path in already:
                 files_skipped_already += 1
                 continue
-            drift_field = file_has_drift_beyond(f, known_field_ids)
+            drift_field = file_has_drift_beyond(f, known_field_names, src_schema)
             if drift_field is not None and ns in needs_rewrite_sources_by_field.get(drift_field, set()):
                 files_skipped_rewrite += 1
                 continue
@@ -648,70 +748,111 @@ def register_table(table_name: str, cfg: dict) -> tuple:
     #    data, never the historical bulk.
     rewritten_rows = 0
     for ns, field_id, name, ftype in rewrite_needed:
-        if name not in {f.name for f in target_table.schema().fields}:
-            with target_table.update_schema() as us:
-                us.add_column(name, ftype)
-            target_table = cat.load_table(target_id)
-            fresh_id = target_table.schema().find_field(name).field_id
-            logger.info("  [%s] rewrite: '%s' (from %s) assigned fresh field_id=%d", table_name, name, ns, fresh_id)
-
-        src_table = cat.load_table(f"{ns}.{table_name}")
-        _, files = files_by_source[ns]
+        src_schema, files = files_by_source[ns]
         to_rewrite = [
             task.file
             for task in files
-            if task.file.file_path not in already and file_has_drift_beyond(task.file, known_field_ids) == field_id
+            if task.file.file_path not in already
+            and file_has_drift_beyond(task.file, known_field_names, src_schema) == field_id
         ]
         if not to_rewrite:
             continue
 
-        # Idempotency check for the rewrite path: these are real physical
-        # writes, not manifest splices, so they can't be deduped by
-        # file_path the way the no-rewrite path is. Check by row content
-        # instead (does the target already have non-null values for this
-        # source+field?).
-        #
-        # This scan's row_filter restricts to source_id_column = ns, but the
-        # matching files (spliced in by reference in a prior run, per this
-        # tool's whole no-rewrite design) still physically live under NS's
-        # OWN storage location, not the target's -- and Polaris only ever
-        # vends the target table's credential scoped to the target's own
-        # location. Reading through target_table.io alone hits AWS
-        # ACCESS_DENIED here (reproduced live, see CHANGELOG.md's "Known
-        # issue: collision-rewrite path can hit ACCESS_DENIED under vended
-        # credentials"). Temporarily swap in a FileIO that also tries this
-        # source's own vended credential -- src_table.io -- before falling
-        # back to failure; restore the target's own IO immediately after so
-        # writes later in this function always go through its own credential.
-        original_io = target_table.io
-        target_table.io = MultiSourceFileIO([target_table.io, src_table.io])
-        try:
-            already_rewritten = target_table.scan(
-                row_filter=f"{source_id_column} = '{ns}' and {name} is not null",
-                selected_fields=(name,),
-            ).to_arrow().num_rows
-        finally:
-            target_table.io = original_io
-        expected_rows = sum(f.record_count for f in to_rewrite)
-        if already_rewritten >= expected_rows:
-            logger.info(
-                "  [%s] '%s' from %s: %d row(s) already rewritten/appended in a prior run, skipping",
+        src_table = cat.load_table(f"{ns}.{table_name}")
+        column_already_exists = name in {f.name for f in target_table.schema().fields}
+
+        if column_already_exists:
+            # The column is already registered. With the atomic fix below,
+            # that alone would normally be enough to know its data is there
+            # too -- but a run from BEFORE this fix could have left the
+            # column registered with none of this source's data ever
+            # appended (see CHANGELOG.md "Fixed: silent field-id collision
+            # misattribution" and file_has_drift_beyond()'s docstring for
+            # the full mechanism). Check row content explicitly rather than
+            # trusting "column exists" alone, so a pre-existing broken state
+            # gets healed instead of silently staying broken.
+            #
+            # This scan's row_filter restricts to source_id_column = ns, but
+            # the matching files (spliced in by reference in a prior run,
+            # per this tool's whole no-rewrite design) still physically
+            # live under NS's OWN storage location, not the target's -- and
+            # Polaris only ever vends the target table's credential scoped
+            # to the target's own location. Reading through target_table.io
+            # alone hits AWS ACCESS_DENIED here (reproduced live, see
+            # CHANGELOG.md's "Known issue: collision-rewrite path can hit
+            # ACCESS_DENIED under vended credentials"). Temporarily swap in
+            # a FileIO that also tries this source's own vended credential
+            # -- src_table.io -- before falling back to failure; restore
+            # the target's own IO immediately after.
+            original_io = target_table.io
+            target_table.io = MultiSourceFileIO([target_table.io, src_table.io])
+            try:
+                already_rewritten = target_table.scan(
+                    row_filter=f"{source_id_column} = '{ns}' and {name} is not null",
+                    selected_fields=(name,),
+                ).to_arrow().num_rows
+            finally:
+                target_table.io = original_io
+            expected_rows = sum(f.record_count for f in to_rewrite)
+            if already_rewritten >= expected_rows:
+                logger.info(
+                    "  [%s] '%s' from %s: %d row(s) already rewritten/appended in a prior run, skipping",
+                    table_name,
+                    name,
+                    ns,
+                    already_rewritten,
+                )
+                continue
+            logger.warning(
+                "  [%s] '%s' from %s: column exists but only %d/%d expected row(s) present -- looks like "
+                "a leftover from an interrupted run from BEFORE the atomic-commit fix. Appending the "
+                "missing rows now (schema unchanged, data-only commit).",
                 table_name,
                 name,
                 ns,
                 already_rewritten,
+                expected_rows,
             )
-            continue
 
+        tabs = []
         for f in to_rewrite:
             tab = src_table.scan(row_filter=f"{name} is not null").to_arrow()
             if tab.num_rows == 0:
                 continue
             tab = tab.append_column(source_id_column, pa.array([ns] * tab.num_rows, type=pa.string()))
-            target_table.append(tab)
-            rewritten_rows += tab.num_rows
-            logger.info("  [%s] rewrote + appended %d row(s) from %s (field '%s')", table_name, tab.num_rows, ns, name)
+            tabs.append(tab)
+        if not tabs:
+            continue
+
+        # THE FIX: schema evolution (if the column is new) and every file's
+        # data append for this collision now commit as ONE atomic
+        # Transaction -- either both land together in a single snapshot, or
+        # neither does. Before this, add_column() was its own standalone
+        # commit, followed by a separate append() per file; an interruption
+        # between them left the column registered with no data, AND (see
+        # file_has_drift_beyond()'s docstring) made drift-detection stop
+        # flagging this source's file at all on the next run, since the
+        # field id was already "known" -- reproduced live, see
+        # CHANGELOG.md "Fixed: silent field-id collision misattribution".
+        with target_table.transaction() as txn:
+            if not column_already_exists:
+                with txn.update_schema() as us:
+                    us.add_column(name, ftype)
+            for tab in tabs:
+                txn.append(tab)
         target_table = cat.load_table(target_id)
+        fresh_id = target_table.schema().find_field(name).field_id
+        rows_this_pass = sum(t.num_rows for t in tabs)
+        rewritten_rows += rows_this_pass
+        logger.info(
+            "  [%s] rewrite: '%s' (from %s) field_id=%d, %d row(s) rewritten + appended (%s)",
+            table_name,
+            name,
+            ns,
+            fresh_id,
+            rows_this_pass,
+            "schema + data committed atomically" if not column_already_exists else "data-only, healing pre-fix state",
+        )
 
     total = total_new_rows + rewritten_rows
     elapsed = time.time() - t_start

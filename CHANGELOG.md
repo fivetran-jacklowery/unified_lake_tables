@@ -386,6 +386,150 @@ baseline fix above, and not undertaken here. Left as an open, clearly
 documented gap (see README.md's "What this does NOT yet handle" and
 Troubleshooting sections) rather than silently declared handled.
 
+### Fixed: silent field-id collision misattribution
+
+Reproduced live (not hypothetical), against the exact `warehouses` /
+`synth_src_changing_03` / `synth_src_changing_04` collision this project's
+own prior entries above already describe: after the ACCESS_DENIED fix let
+the collision-rewrite path's idempotency check run without crashing, a
+subsequent run of `register_consolidation.py` against a real customer-style
+target (`for_casey.warehouses`, built via an external VS Code integration
+attempt) left `synth_src_changing_03`'s 50 `loading_dock_type` rows silently
+readable as `dock_supervisor_name` instead -- no error, no warning, wrong
+data. Root cause was a real gap in `file_has_drift_beyond()`, not the
+ACCESS_DENIED path: it only ever checked whether a field id was *present* in
+`known_field_ids`, never whether the target's registered *name* for that id
+agreed with what the file's own source calls it. Two distinct ways this bit
+us, both reproduced directly:
+
+1. **Day one, no interruption needed at all.** `create_target_table()` seeds
+   the target's starting schema from `source_namespaces[0]`'s full schema,
+   so a field id source #1 already happens to use is "known" from table
+   creation -- before drift-detection is ever called for any OTHER source's
+   files. A second source landing a differently-named column on that same
+   numeric id (routine for independently-evolving sources, since each
+   starts counting from its own schema's next free id) was never flagged as
+   drift and got silently spliced in under source #1's name for that id.
+   Reproduced against two disposable two-source test tables with no
+   interruption of any kind -- a clean, uninterrupted first run mislabels
+   the data.
+2. **An interrupted collision-rewrite** (the scenario this project's own
+   prior entries assumed was the only risk here): the "owner" name for a
+   colliding id is committed as soon as the collision is first detected,
+   independently of whether the *losing* source's rewrite (a separate,
+   later commit under the old two-commit design) ever completes. If that
+   rewrite is interrupted after its schema-evolution commit but before its
+   data-append commit, a rerun sees the id as "known" from the owner's
+   already-committed widening and never re-flags the loser's still-
+   unresolved file, even though its rewrite never actually happened. This
+   is what happened to `for_casey.warehouses` in practice.
+
+**The fix**, in `file_has_drift_beyond()`: compare the file's own source's
+name for a field id (via that source's live schema) against the target's
+registered name for the same id, not just whether the id is present.
+`known_field_ids` (a set) became `known_field_names` (a `{field_id: name}`
+dict) threaded through all three call sites. A name mismatch is still-
+unresolved drift regardless of whether the id itself is otherwise "known."
+
+This also required fixing the widening step in `register_table()`: it used
+to assume the first distinct name seen in a given run could always freely
+claim a drifted field id (`if owner_name not in already_field_names`), which
+is only safe if the target doesn't *already* have a different name
+registered for that exact id. With the corrected drift-detection now
+catching the day-one scenario too, the target frequently already has a name
+for the id in play (seeded at creation, per case 1 above) -- and Polaris
+correctly rejects a schema-evolution commit that tries to claim an id the
+target's schema already uses for something else (`HTTP 400 Bad Request`,
+reproduced live while validating this fix). Fixed by checking
+`known_field_names` for an existing name first: if the target already has
+one, that name is the true owner outright and *every* distinct name seen
+this run goes through the rewrite path, not just "everyone after the
+first."
+
+Verified end-to-end against disposable two-source test tables (day-one
+scenario: clean first run now correctly detects and resolves the collision
+instead of mislabeling; three consecutive runs settle into a stable,
+correct, zero-churn steady state) and against the real, already-corrupted
+`for_casey.warehouses`: removed the single 50-row culprit manifest entry
+(identified via its file-level `null_value_counts`, which pinpointed the
+exact physical file down to its record count matching the known-bad row
+count), then reran the fixed script, which correctly re-detected the
+collision and re-derived the 50 rows under `loading_dock_type` -- confirmed
+via a cross-namespace scan (`MultiSourceFileIO`) that `synth_src_changing_03`
+now shows 0 rows under `dock_supervisor_name` / 50 under `loading_dock_type`,
+while `synth_src_changing_04`'s legitimately-owned 40 `dock_supervisor_name`
+rows were untouched throughout.
+
+### Fixed: the collision-rewrite path's two commits weren't atomic
+
+Companion fix to the misattribution bug above, closing the actual
+interruption window rather than just detecting its aftermath more
+correctly. Before this, `register_table()`'s rewrite pass committed a
+drifted column's schema evolution (`add_column`) as one standalone commit,
+then appended each drifted file's data as one or more *separate* commits
+after it -- real physical writes, not the cheap no-rewrite splice path, so
+there was a real window between them where the process could be
+interrupted, crash, or lose its network connection with the schema change
+durable and the data not.
+
+**The fix:** wrap the schema evolution (when the column is new) and every
+file's data append for a given collision into one `pyiceberg`
+`Transaction` -- `Transaction.table_metadata` layers pending `update_schema`
+calls onto the in-progress metadata, so a subsequent `Transaction.append()`
+in the *same* transaction correctly resolves the not-yet-committed column,
+and `commit_transaction()` (called automatically on a clean `__exit__`)
+writes both as a single atomic snapshot. Confirmed directly (not just by
+reading `pyiceberg`'s source) against a disposable test table: raising an
+exception partway through an open `with table.transaction() as txn:` block
+-- after `txn.update_schema()` and one `txn.append()` had already run --
+left the catalog completely unchanged on read-back: no new column, no new
+rows, snapshot count unchanged. Either everything in the transaction lands,
+or nothing does.
+
+A run from *before* this fix can still have left a column registered with
+none of its data appended (exactly the `for_casey.warehouses` case above).
+The rewrite pass now checks for that explicitly rather than assuming
+"column exists" always means "fully done": if the column already exists but
+an idempotency-style row-count check finds fewer rows than expected, it logs
+a clear warning and appends the missing rows as a data-only commit (no
+schema change needed), self-healing the pre-fix state instead of silently
+leaving it broken.
+
+### Fixed: rewrite-path files were perpetually treated as copy-on-write orphans
+
+Found while verifying the two fixes above, not part of the original ask --
+a genuine rerun of the fixed script surfaced it immediately (an orphan
+retirement + rewrite churn cycle on every single run of a table with any
+resolved collision, which shouldn't happen). `already_registered_by_source()`
+returned every file registered under a source's partition, used both for
+the plain "already spliced, skip" check and for copy-on-write orphan
+detection (does this path still appear in the source's own current file
+listing). Those two checks need different inputs: a file created by the
+collision-rewrite path (`Transaction.append()`, see above) is a brand-new
+physical file written under the *target's own* storage location, not a
+splice-by-reference of a source file -- it will never appear in any
+source's own file listing, by construction, regardless of whether anything
+is wrong with it. Using the full set for orphan detection meant every
+rewritten/appended file got flagged as orphaned and deleted, then
+re-derived from scratch, on every subsequent run.
+
+**The fix:** `already_registered_by_source()` now returns
+`(by_source, spliced_by_source)` -- the second only includes files whose
+path doesn't start with the target table's own storage location, i.e.
+files still genuinely spliced in by reference from a source. The orphan-
+check loop in `register_table()`'s no-rewrite pass now uses
+`spliced_by_source` instead of the full set; the plain idempotency check
+(`already`) is unaffected and still uses the full set, since re-splicing an
+already-registered path is the thing it's guarding against regardless of
+which mechanism registered that path.
+
+Verified directly: three consecutive runs against the same disposable
+two-source collision test table now show 0 orphaned files retired and 0
+rows rewritten on runs 2 and 3 (previously, run 2 alone deleted and
+re-appended the rewritten file's data), and the table's snapshot count
+stayed at 2 across all three runs (the two commits from run 1; nothing
+added by the no-op reruns).
+
 ## [1.0.0]
 
 Initial public-facing release, adapted from an internal R&D reference
