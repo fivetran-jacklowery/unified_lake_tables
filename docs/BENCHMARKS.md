@@ -130,7 +130,51 @@ Finding Fivetran MDLS's actual retention setting converts this from an
 unbounded worry into arithmetic. This remains an open gap; see the
 CHANGELOG's "Explicitly out of scope" list.
 
-## 5. Where this leaves the pitch
+## 5. Independent corroboration from a customer workload
+
+A customer benchmarked this against their production read path on
+2026-09-22 (tool @ `e6a2287`, pyiceberg 0.11.1, DuckDB 1.5.2 with the
+iceberg + httpfs extensions). Their existing approach is exactly the
+alternative this tool replaces: per-source `iceberg_scan` combined with
+`UNION ALL BY NAME`, reading from Fivetran MDLS. Ten sources, Google Search
+Console, all with an identical field-id → (name, type) mapping.
+
+Correctness: row count and content hash **byte-identical** to their
+baseline for every tenant, through both the S3 and Polaris read paths.
+
+| Variant | Median | Min | vs. baseline |
+|---|---|---|---|
+| `union` (baseline) | 128.4s | 127.7s | — |
+| `unified_s3` | 102.7s | 102.3s | **−20%** |
+| `unified_polaris` | 100.2s | 99.1s | **−22%** |
+| `union_1org` (baseline) | 30.5s | 29.7s | — |
+| `unified_s3_1org` | 18.6s | 17.7s | **−39%** |
+
+Plus a cost their baseline pays that these timings exclude: a compile-time
+metadata discovery glob, ~21s for this table and ~5s for GA4. The Polaris
+read path does not need that step at all.
+
+**This sharpens §3 rather than contradicting it.** Their own read is that
+both variants read the same Parquet files, so the savings come from
+per-source overhead — one scan and one metadata resolution per source —
+not from scan throughput. That is the same conclusion §2 reaches from
+planning cost alone, now confirmed in end-to-end wall clock on a real
+workload.
+
+The single-source case is the instructive one. In §3's local test DuckDB
+folded the literal and eliminated seven of eight branches, which made the
+union look nearly free. Here, filtering to one org still gained **39%** —
+because with per-source `iceberg_scan`, each branch resolves its own
+Iceberg metadata whether or not its rows survive the filter. Branch
+elimination on a literal does not save you the per-source metadata
+resolution that a real multi-table union pays.
+
+So the honest refinement: a union's *data* pruning can match the identity
+partition, but its *metadata* cost scales with source count no matter what
+the optimizer does. That is the durable advantage, and at ten sources it is
+worth 20–39% of end-to-end query time.
+
+## 6. Where this leaves the pitch
 
 Strongest framing, supported by measurement:
 

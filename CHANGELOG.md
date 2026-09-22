@@ -4,6 +4,73 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Customer report: field-id order divergence -- already fixed, but expensive and unsignposted
+
+A customer running this tool against their Fivetran MDLS lake reported
+(2026-09-22) that on a table whose sources assign field ids in **different
+orders**, the consolidated table returned **silently incorrect values** --
+metrics in the wrong columns, a float truncated to integers -- while the run
+reported success with 0 collisions, 0 warnings, and matching row counts.
+
+**Root cause: they were on `e6a2287`, three commits behind.** The guard that
+catches this landed in `e1650c1` ("Fix silent field-id collision
+misattribution"), which added the comparison of each source's OWN name for a
+field id against the target's registered name:
+
+```python
+src_field = src_schema.find_field(field_id) if src_schema else None
+if src_field is not None and src_field.name != target_name:
+    return field_id
+```
+
+Before `e1650c1`, `file_has_drift_beyond()` only flagged ids the target did
+not know *at all*. Since the target is seeded from `source_namespaces[0]`,
+every id another source might reuse for a different column was already
+"known," so nothing was flagged and the files were spliced in by reference.
+**The first action for this customer is to upgrade.**
+
+**Reproduced, then confirmed fixed.** Built `../connectors/synth_order_01`
+and `_02`: identical table, identical column names, identical types, only
+the declaration ORDER differs -- so field id 2 is `clicks` (long) in one and
+`ctr` (double) in the other, and field id 3 is the reverse. Values were
+chosen disjoint (`clicks` 1000..9999, `ctr` 0.0..1.0) so a crossed id is
+unmistakable. On current HEAD the disagreement is detected, the divergent
+source is routed through the rewrite path, and the values land **correct**
+for both sources; a second run is a clean no-op.
+
+**What was still wrong: the cost is invisible.** Because a file's field ids
+are baked into its Parquet footer, rewriting is the only way to make a
+divergent source safe -- so it gets **0 files spliced and 100% of its rows
+physically rewritten**, reported as an ordinary "collision." For base-schema
+divergence across many sources that is an enormous first run that forfeits
+the no-rewrite premise, and nothing said so beforehand.
+
+Added a pre-flight check, `find_field_id_disagreements()`, run before the
+target is created (the per-source schema/file load was reordered ahead of
+target creation to make it a true pre-flight, and is now reused rather than
+re-fetched). It **warns, it does not abort** -- the run is correct either
+way, and refusing would regress behavior that works.
+
+It also distinguishes the two cases by measuring rather than assuming, since
+they look identical in the schema but have very different bills: it counts
+how many of the divergent source's files actually carry data for a contested
+id. Base-schema divergence hits ~100% of files and gets the loud warning
+with a per-source file-count table; ordinary drift hits only recent files
+and gets a one-line INFO noting the routine collision path will handle it at
+normal cost. Verified both ways: `synth_order_02` 4/4 files (100%) → full
+warning; `synth_collide_02` 7/11 (64%) → quiet INFO, no alarm.
+
+Also fixed a misleading diagnostic on this path. When a divergent source's
+column already exists because ANOTHER source contributed it, the rewrite
+step asserted the rarer explanation as fact -- "looks like a leftover from
+an interrupted run from BEFORE the atomic-commit fix" -- sending whoever
+reads the log hunting a failure that never happened. It now names both
+possibilities and which is the common one.
+
+Regression-checked the uniform-schema path (8 `synth_src_changing_*` sources):
+silent on disagreements, 11 files / 5,772 rows spliced, 0 rewritten, and a
+clean `verify_consolidation.py` across all 8 sources.
+
 ### Measured: a `UNION ALL` view prunes too -- the original pitch was wrong
 
 Measured 2026-09-22 against the live Polaris catalog and DuckDB 1.5.5, on
