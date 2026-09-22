@@ -22,16 +22,32 @@ on why this beats a `UNION ALL` view or a materialized merge job, see
 
 If you run N connections of the same connector (say, one SQL Server
 connection per tenant database, all landing the same table shapes), you
-end up with N copies of every table instead of one. The usual fixes to
-that both cost more the more data you have: a `UNION ALL` view re-scans
-every source's full data on every single query, and a materialized merge
-job physically rewrites everything into one table, every time it runs,
-whether or not anything actually changed since the last run.
+end up with N copies of every table instead of one. The usual fixes both
+get more expensive as you add sources: a `UNION ALL` view has to load and
+plan all N source tables on every query, and a materialized merge job
+physically rewrites everything into one table, every time it runs, whether
+or not anything actually changed since the last run.
+
+**A correction, since this README used to overstate the case.** It claimed
+a `UNION ALL` view "re-scans every source's full data on every single
+query." Measured, that is false against a competent optimizer: each union
+branch tags rows with a literal source id, and an engine that constant-
+folds that literal eliminates the branches that cannot match a filter on
+it. DuckDB prunes a filtered 8-source union down to a single file scan --
+exactly as well as this tool's identity partition does. And because
+no-rewrite consolidation points at the *same physical Parquet files* a
+union would read, its data-scan cost can never be lower. The measured
+advantage is **planning cost** -- 11.3x on eight sources, growing roughly
+linearly with source count -- plus having one stable object to point
+downstream tools at. That is a narrower claim than the original, and it is
+the one the numbers actually support. See
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 Here's a useful way to think about what this tool does instead. Imagine N
 libraries, each with its own card catalog and its own shelves of books. A
-`UNION ALL` view is like re-reading every relevant book from every library
-every time someone asks a question. A merge job is like photocopying every
+`UNION ALL` view is like having to walk into all N libraries and consult
+each one's card catalog before you can answer anything -- even when the
+book you need is in just one of them. A merge job is like photocopying every
 relevant book from every library onto one new shelf on a schedule, whether
 or not anything changed. This tool builds one new card catalog whose cards
 point directly at books still sitting on the original libraries' shelves.

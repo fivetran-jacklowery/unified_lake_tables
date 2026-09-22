@@ -4,6 +4,41 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Measured: a `UNION ALL` view prunes too -- the original pitch was wrong
+
+Measured 2026-09-22 against the live Polaris catalog and DuckDB 1.5.5, on
+`shipments` across the eight `synth_src_changing_*` sources. Full numbers,
+methodology and caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md);
+reproduce with the new `scripts/bench_vs_union.py`.
+
+The README asserted, without measurement, that a `UNION ALL` view
+"re-scans every source's full data on every single query." **That is false
+against a competent optimizer.** Each union branch tags rows with a literal
+source id, and DuckDB constant-folds that literal and eliminates the
+branches that cannot match a filter on it -- the filtered union's plan
+collapses to a single `READ_PARQUET` node, 1 of 8 sources. It prunes
+exactly as well as this tool's identity partition does.
+
+Two related claims also have to go, one of them structural:
+
+- **Data-scan cost cannot differ, ever.** No-rewrite consolidation points
+  the target manifest at the *same physical Parquet files* the union reads.
+  Same bytes, same row groups. No "we read less data" claim about this
+  technique can be true.
+- Filtering on any column *other* than the source id gives neither approach
+  an advantage; both read everything.
+
+**What survives, and is still a strong argument: planning cost.** 672 ms vs
+7,567 ms unfiltered (**11.3x**), 305 ms vs 894 ms filtered. The union issues
+8 `loadTable` calls and traverses 8 manifest trees where the consolidated
+table issues one -- and that gap grows roughly linearly with source count,
+so at 400 tenants it dominates. Identity-partition pruning itself works as
+designed (22/145 files, 14.2% of rows).
+
+Caveat: **DuckDB is not Snowflake.** Whether Snowflake folds union-branch
+literals the same way is untested; confirm before repeating this to a
+customer on Snowflake. README positioning updated accordingly.
+
 ### Fixed: collision rewrite appended one duplicate copy per drifted file
 
 Found by reading and then **reproduced live against real infrastructure**,
@@ -72,6 +107,12 @@ compare mismatched quantities.
 
 ### Added
 
+- `scripts/bench_vs_union.py` -- measures planning cost, per-source
+  staleness, and (with `--with-duckdb`) whether a real optimizer prunes
+  `UNION ALL` branches on the literal source id. Reuses
+  `register_consolidation.py`'s config/credential plumbing so it cannot
+  drift from how the tool actually authenticates. Backs
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 - **Pattern-based source namespace discovery.** `config.yaml` now accepts
   `source_namespace_pattern` (a glob, e.g. `"tenant_*"`) as an alternative to
   hand-enumerating `source_namespaces`, resolved against the catalog's real
