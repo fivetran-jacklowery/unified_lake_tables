@@ -4,6 +4,72 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Fixed: collision rewrite appended one duplicate copy per drifted file
+
+Found by reading and then **reproduced live against real infrastructure**,
+2026-09-22. In `register_consolidation.py`'s step 4 rewrite pass:
+
+```python
+for f in to_rewrite:
+    tab = src_table.scan(row_filter=f"{name} is not null").to_arrow()
+```
+
+The loop variable `f` is never used in the body. The scan covers the
+**whole source table** and is re-run identically on each iteration, so
+`tabs` ends up holding `len(to_rewrite)` identical copies, and the loop
+below appends every one of them. With 2+ drifted files for a single
+colliding field id, that source's rows land in the target N times over and
+`rewritten_rows` reports N times the true count.
+
+**The reproduction.** Nothing existing could trigger this -- the eight
+`synth_src_changing_*` fixtures are byte-identical by construction, so they
+never collide. Built a purpose-built two-source fixture instead, at
+`../connectors/synth_collide_01` and `../connectors/synth_collide_02`
+(Connector SDK; that directory is outside this repo, alongside the other
+connectors). Both declare an identical 9-column base table `widgets`, then
+each grows ONE new column with a different name -- `alpha_metric` in 01,
+`beta_flag` in 02 -- which is emitted as an undeclared extra key on the
+second sync, the way real source drift actually arrives. Because both
+tables sit at the same highest field id when the new column lands, both
+new columns take **field id 12**, with different names. That is the
+collision. Sync 1 lands 20,000 rows with no drift column; sync 2 lands
+25,000 rows all carrying it, which the writer spread over **7 files**.
+
+Measured, first run, before the fix:
+
+```
+COLLISION at field_id=12: 'alpha_metric' already owns it,
+  'synth_collide_02'.'beta_flag' needs a fresh field id + rewrite
+synth_collide_02: 4 file(s) spliced in, 20000 rows (7 pending physical rewrite)
+rewrite: 'beta_flag' (from synth_collide_02) field_id=100001,
+  175000 row(s) rewritten + appended
+```
+
+175,000 where 25,000 was correct -- an exact **7x**, one copy per file in
+`to_rewrite`. Target-side: `synth_collide_02` held 195,000 rows (20,000
+correctly spliced + 175,000 duplicated) against a 45,000-row source, while
+`synth_collide_01` was correct at 45,000.
+
+**The fix.** Not "use `f`" -- that single scan already returns every drifted
+row across all of the source's files, so the loop was simply redundant and
+collapses to one scan. `to_rewrite` still decides *whether* there is
+anything to rewrite and how many rows to expect. After the fix, rebuilt
+from scratch: 25,000 rows rewritten, both sources exactly 1.00x, and the
+run dropped from **23.6s to 8.8s** (six redundant whole-table scans gone).
+A third run is a clean no-op (0 spliced, 0 rewritten, 0 orphaned), so
+idempotency still holds through the collision path.
+
+Note `verify_consolidation.py`'s duplicate-file check would **not** have
+caught this -- each append writes a new, distinct file path, so there is no
+duplicated path to find. Its row-count check does catch it, and did.
+
+Residual, not reproduced: the skip guard compares `already_rewritten`
+(rows where the column is non-null) against `expected_rows` (the full
+`record_count` of every drifted file). Those are the same number only when
+drifted files contain nothing but drifted rows, which was true here. A file
+mixing null and non-null values for the new column could make the guard
+compare mismatched quantities.
+
 ### Added
 
 - **Pattern-based source namespace discovery.** `config.yaml` now accepts

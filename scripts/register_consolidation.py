@@ -784,12 +784,27 @@ def register_table(table_name: str, cfg: dict) -> tuple:
             # a FileIO that also tries this source's own vended credential
             # -- src_table.io -- before falling back to failure; restore
             # the target's own IO immediately after.
+            # source_id_column MUST stay in selected_fields even though only
+            # `name` is counted. The target is identity-partitioned on
+            # source_id_column, and pyiceberg's _get_column_projection_values
+            # resolves the partition source field against the PROJECTED
+            # schema, not the table schema:
+            #     partition_schema = partition_spec.partition_type(projected_schema)
+            # That line is reached whenever the projection contains a field id
+            # the physical file lacks -- which is always true here, because a
+            # collision gives `name` a fresh out-of-band field id that no
+            # spliced source file physically carries. Projecting `name` alone
+            # therefore crashes with "ValueError: Could not find field with
+            # id: <reserved id>" (reproduced live 2026-09-10 on a real
+            # two-source collision). Keeping source_id_column in the
+            # projection puts the partition source field in the projected
+            # schema, so it resolves and the identity value backfills.
             original_io = target_table.io
             target_table.io = MultiSourceFileIO([target_table.io, src_table.io])
             try:
                 already_rewritten = target_table.scan(
                     row_filter=f"{source_id_column} = '{ns}' and {name} is not null",
-                    selected_fields=(name,),
+                    selected_fields=(name, source_id_column),
                 ).to_arrow().num_rows
             finally:
                 target_table.io = original_io
@@ -814,15 +829,25 @@ def register_table(table_name: str, cfg: dict) -> tuple:
                 expected_rows,
             )
 
-        tabs = []
-        for f in to_rewrite:
-            tab = src_table.scan(row_filter=f"{name} is not null").to_arrow()
-            if tab.num_rows == 0:
-                continue
-            tab = tab.append_column(source_id_column, pa.array([ns] * tab.num_rows, type=pa.string()))
-            tabs.append(tab)
-        if not tabs:
+        # ONE scan, not one per file in to_rewrite. This used to be a
+        # `for f in to_rewrite:` loop whose body never referenced `f` -- it
+        # re-ran the identical whole-table scan on every iteration and
+        # appended every copy, so a source with N drifted files had its
+        # drifted rows landed N times over. Reproduced live against a
+        # purpose-built two-source collision (connectors/synth_collide_0*):
+        # 7 drifted files produced 175,000 rows where 25,000 were correct,
+        # an exact 7x. See CHANGELOG.md "Fixed: collision rewrite appended
+        # one duplicate copy per drifted file".
+        #
+        # A single scan is already complete: `name is not null` selects every
+        # drifted row across all of this source's files at once, which is
+        # exactly what the rewrite needs. to_rewrite is still what decides
+        # WHETHER there is anything to rewrite, and how many rows to expect.
+        tab = src_table.scan(row_filter=f"{name} is not null").to_arrow()
+        if tab.num_rows == 0:
             continue
+        tab = tab.append_column(source_id_column, pa.array([ns] * tab.num_rows, type=pa.string()))
+        tabs = [tab]
 
         # THE FIX: schema evolution (if the column is new) and every file's
         # data append for this collision now commit as ONE atomic
