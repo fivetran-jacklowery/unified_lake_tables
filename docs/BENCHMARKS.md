@@ -2,7 +2,7 @@
 
 Measured 2026-09-22 against the live Fivetran-managed Polaris catalog, on
 the `shipments` table across the eight `synth_src_changing_*` source
-namespaces consolidated into `for_jack_consolidated.shipments`
+namespaces consolidated into `consolidated.shipments`
 (145 files, ~492k rows at time of measurement).
 
 Reproduce with:

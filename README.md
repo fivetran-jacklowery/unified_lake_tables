@@ -229,6 +229,15 @@ transformation, deduplication across sources, or a canonical schema that
 differs in shape from every source's native schema, keep using dbt or a
 real merge job.
 
+## Test fixtures
+
+`fixtures/connectors/` holds purpose-built Fivetran Connector SDK sources
+that manufacture the exact conditions two correctness bugs needed -- a
+field-id collision with multiple drifted files, and two sources whose base
+schemas assign field ids in different orders. Neither is reproducible with
+ordinary sources. See [fixtures/connectors/README.md](fixtures/connectors/README.md)
+and the matching CHANGELOG entries for the measured before/after.
+
 ## Vended credentials: what's actually confirmed
 
 This was validated two different ways, and it's worth being precise about

@@ -516,7 +516,7 @@ def find_field_id_disagreements(schemas_by_source: dict) -> list:
 
     This guards a failure mode the collision logic structurally cannot see,
     and which silently corrupts data. Reported by a customer 2026-09-22 and
-    reproduced here with connectors/synth_order_0*.
+    reproduced here with fixtures/connectors/synth_order_0*.
 
     The collision path in register_table() only ever fires on *drift* --
     file_has_drift_beyond() flags a field id the TARGET does not already
@@ -996,7 +996,7 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         # re-ran the identical whole-table scan on every iteration and
         # appended every copy, so a source with N drifted files had its
         # drifted rows landed N times over. Reproduced live against a
-        # purpose-built two-source collision (connectors/synth_collide_0*):
+        # purpose-built two-source collision (fixtures/connectors/synth_collide_0*):
         # 7 drifted files produced 175,000 rows where 25,000 were correct,
         # an exact 7x. See CHANGELOG.md "Fixed: collision rewrite appended
         # one duplicate copy per drifted file".

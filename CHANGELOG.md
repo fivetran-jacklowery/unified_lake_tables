@@ -29,7 +29,7 @@ every id another source might reuse for a different column was already
 "known," so nothing was flagged and the files were spliced in by reference.
 **The first action for this customer is to upgrade.**
 
-**Reproduced, then confirmed fixed.** Built `../connectors/synth_order_01`
+**Reproduced, then confirmed fixed.** Built `fixtures/connectors/synth_order_01`
 and `_02`: identical table, identical column names, identical types, only
 the declaration ORDER differs -- so field id 2 is `clicks` (long) in one and
 `ctr` (double) in the other, and field id 3 is the reverse. Values were
@@ -214,9 +214,8 @@ colliding field id, that source's rows land in the target N times over and
 **The reproduction.** Nothing existing could trigger this -- the eight
 `synth_src_changing_*` fixtures are byte-identical by construction, so they
 never collide. Built a purpose-built two-source fixture instead, at
-`../connectors/synth_collide_01` and `../connectors/synth_collide_02`
-(Connector SDK; that directory is outside this repo, alongside the other
-connectors). Both declare an identical 9-column base table `widgets`, then
+`fixtures/connectors/synth_collide_01` and `_02`. Both declare an
+identical 9-column base table `widgets`, then
 each grows ONE new column with a different name -- `alpha_metric` in 01,
 `beta_flag` in 02 -- which is emitted as an undeclared extra key on the
 second sync, the way real source drift actually arrives. Because both
@@ -669,7 +668,7 @@ Reproduced live (not hypothetical), against the exact `warehouses` /
 own prior entries above already describe: after the ACCESS_DENIED fix let
 the collision-rewrite path's idempotency check run without crashing, a
 subsequent run of `register_consolidation.py` against a real customer-style
-target (`for_casey.warehouses`, built via an external VS Code integration
+target (`demo_ns.warehouses`, built via an external VS Code integration
 attempt) left `synth_src_changing_03`'s 50 `loading_dock_type` rows silently
 readable as `dock_supervisor_name` instead -- no error, no warning, wrong
 data. Root cause was a real gap in `file_has_drift_beyond()`, not the
@@ -698,7 +697,7 @@ us, both reproduced directly:
    data-append commit, a rerun sees the id as "known" from the owner's
    already-committed widening and never re-flags the loser's still-
    unresolved file, even though its rewrite never actually happened. This
-   is what happened to `for_casey.warehouses` in practice.
+   is what happened to `demo_ns.warehouses` in practice.
 
 **The fix**, in `file_has_drift_beyond()`: compare the file's own source's
 name for a field id (via that source's live schema) against the target's
@@ -726,7 +725,7 @@ Verified end-to-end against disposable two-source test tables (day-one
 scenario: clean first run now correctly detects and resolves the collision
 instead of mislabeling; three consecutive runs settle into a stable,
 correct, zero-churn steady state) and against the real, already-corrupted
-`for_casey.warehouses`: removed the single 50-row culprit manifest entry
+`demo_ns.warehouses`: removed the single 50-row culprit manifest entry
 (identified via its file-level `null_value_counts`, which pinpointed the
 exact physical file down to its record count matching the known-bad row
 count), then reran the fixed script, which correctly re-detected the
@@ -763,7 +762,7 @@ rows, snapshot count unchanged. Either everything in the transaction lands,
 or nothing does.
 
 A run from *before* this fix can still have left a column registered with
-none of its data appended (exactly the `for_casey.warehouses` case above).
+none of its data appended (exactly the `demo_ns.warehouses` case above).
 The rewrite pass now checks for that explicitly rather than assuming
 "column exists" always means "fully done": if the column already exists but
 an idempotency-style row-count check finds fewer rows than expected, it logs
