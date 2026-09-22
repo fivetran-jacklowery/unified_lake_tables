@@ -39,6 +39,94 @@ Caveat: **DuckDB is not Snowflake.** Whether Snowflake folds union-branch
 literals the same way is untested; confirm before repeating this to a
 customer on Snowflake. README positioning updated accordingly.
 
+### Confirmed: Fivetran's Polaris supports Iceberg views, but denies `CREATE_VIEW`
+
+Investigated 2026-09-22 as a possible alternative to manifest splicing: let
+the catalog hold a `UNION ALL` view instead of building a consolidated
+table. A view references *tables*, not files, so it would be immune to the
+source-side compaction gap below, and it would sidestep the field-id
+collision problem entirely (SQL resolves columns by name at query time).
+
+The catalog advertises the **complete** Iceberg view API in its `/config`
+response -- create, replace, list, load, exists, drop, rename. Read-side
+operations all work: `list_views`, `view_exists`, `load_view` and
+`drop_view` return proper Iceberg semantics (`NoSuchViewError`, not a
+permission error). But `create_view` fails:
+
+```
+ForbiddenException: Principal 'customer_..._user' with activated
+PrincipalRoles '[]' and activated grants via
+'[..._catalog_manager, ..._user_role]' is not authorized for op CREATE_VIEW
+```
+
+Denied **catalog-wide** (tried four namespaces including the target and a
+source). The control case pins it down: the same principal can `create_table`
+and `drop_table` in the very same namespace, so this is not a general write
+restriction -- it is specifically the missing `CREATE_VIEW` grant.
+
+So views are a **grant change, not an architecture change**. Given the
+principal naming this is likely the standard MDLS customer role rather than
+anything account-specific, which would make it a product decision. Needs
+confirmation with whoever owns Polaris grants.
+
+Note this also requires **pyiceberg 0.12.0** -- view CRUD is not in the
+pinned 0.11.1 (which has only one of the three methods).
+
+### Confirmed: upstream pyiceberg changes that affect this tool
+
+Reviewed `apache/iceberg-python` main at `0d584073` (2026-09-18), 86 commits
+past the previously-reviewed `68898e5a`. All findings below are
+**unreleased** -- 0.12.0 shipped 2026-08-22, before these landed -- so
+nothing bites at the pinned 0.11.1 today. Three change the ground under the
+pin and must be re-validated before any upgrade:
+
+- **`DEFAULT_READ_VERSION` flipped 2 -> 3** (#3690). `register_consolidation.py`
+  calls `DataFile.from_args(...)` with no `_table_format_version`, so it
+  binds `DATA_FILE_TYPE[DEFAULT_READ_VERSION]` -- now the V3 struct, which
+  gains four trailing fields (`first_row_id`, `referenced_data_file`,
+  `content_offset`, `content_size_in_bytes`), taking the record from 16
+  slots to 20. Upstream intends this to be transparent (writers project the
+  canonical record down to the target's version), but this is exactly the
+  "a pyiceberg upgrade could silently change this behavior" scenario
+  `requirements.txt` already warns about. Applies to the Glue example too.
+- **The `spec_id=` kwarg has always been a silent no-op** (#3954). Verified
+  against the `pyiceberg-0.11.1` tag: `spec_id` is not a field of
+  `DATA_FILE_TYPE` (it is a separate `_spec_id` slot with a property
+  setter), and 0.11.1's `Record._bind` silently drops unrecognized kwargs.
+  So `spec_id=target_table.spec().spec_id` at `register_consolidation.py`
+  sets nothing. Harmless: the write path never reads `data_file.spec_id`
+  (only `_deleted_data_files` does, at `snapshot.py:214,264`, and orphans
+  come from `plan_files()` where `manifest.py:1084` already populated it).
+  On main it becomes a real keyword-only parameter *and unknown kwargs now
+  raise `TypeError`* -- the silent-ignore safety net is gone.
+- **Decimal scale promotion is broken in 0.11.1 AND 0.12.0** (#3613, #3985).
+  `pyiceberg/schema.py`'s `promote()` for `DecimalType` reads
+  `file_type.scale == file_type.scale` -- a self-comparison, always true --
+  so a promotion that *changes the scale* is accepted and values come back
+  off by powers of ten. Fixed only on main. **This matters here
+  specifically:** `file_has_drift_beyond()` keys on field id plus *name*, so
+  a source evolving `decimal(10,2)` -> `decimal(12,4)` on the same field id
+  with the same name is not drift by this tool's definition, gets spliced
+  straight in, and the read then leans on the broken `promote()`. That is
+  the same silent-wrong-data failure this project exists to prevent, one
+  layer below where it currently looks. Not yet reproduced live.
+
+Also available and worth adopting, unrelated to risk:
+
+- **REST client retry/timeout** (#3418), new opt-in `rest.client.*` catalog
+  properties: `connection-timeout-ms`, `socket-timeout-ms`, `max-retries`,
+  `retry-backoff-factor`. The upstream commit is explicitly motivated by
+  "a Polaris instance returning 504 from a proxy." This tool currently runs
+  threaded per-namespace `RestCatalog` work with no timeout and no retries,
+  so an indefinite hang is possible today. Fully opt-in: absent all four
+  properties `_create_connection_adapter` returns `None` and behavior is
+  unchanged. Retries cover idempotent verbs on transient 5xx and still
+  surface typed exceptions (`ServiceUnavailableError`) on exhaustion.
+
+Good news: **`_last_column_id` and `Transaction._append_snapshot_producer`
+are both untouched** on main -- no commit in that range modified
+`table/update/schema.py` at all, so the reserved-field-id trick still holds.
+
 ### Fixed: collision rewrite appended one duplicate copy per drifted file
 
 Found by reading and then **reproduced live against real infrastructure**,
@@ -107,6 +195,20 @@ compare mismatched quantities.
 
 ### Added
 
+- **`SKILL.md`: an explicit, overriding read-only invariant on source
+  tables.** Source tables may only ever be read (`.scan()`, `.schema()`,
+  `.io`, and the catalog's list/exists/load calls); every write goes to the
+  target namespace. The skill now enumerates what is permitted and what is
+  forbidden, states that a task appearing to need a source modification must
+  be *proposed, never performed*, and gives the non-obvious reason this is
+  absolute: the target's manifest points at the sources' physical Parquet
+  files by absolute path, so ordinary source-side maintenance (compaction,
+  snapshot expiry, orphan cleanup) leaves the target referencing files that
+  no longer exist and queries fail outright. Verified that the invariant
+  currently holds by construction -- across `register_consolidation.py`,
+  `verify_consolidation.py`, `bench_vs_union.py` and the Glue example, every
+  mutating call's receiver is `target_table` or a transaction on it, and
+  source handles only ever receive `.scan()`, `.schema()` and `.io`.
 - `scripts/bench_vs_union.py` -- measures planning cost, per-source
   staleness, and (with `--with-duckdb`) whether a real optimizer prunes
   `UNION ALL` branches on the literal source id. Reuses
