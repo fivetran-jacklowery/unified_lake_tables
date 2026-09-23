@@ -4,6 +4,53 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Added: Delta Lake support (experimental) -- one set of files, two metadata layers
+
+Databricks customers cannot read the consolidated Iceberg table. They can
+read the same *files* through a Delta log, so `scripts/generate_delta_log.py`
+emits a `_delta_log` whose `add` entries point at exactly the Parquet the
+Iceberg manifest points at, by absolute URI -- the mechanism behind Delta
+shallow clone. Two independent metadata layers over one shared set of data
+files. No bytes copied, Iceberg side untouched. Full writeup, rationale and
+caveats in [docs/DELTA_LAKE_SUPPORT.md](docs/DELTA_LAKE_SUPPORT.md).
+
+**Validated live** (2026-09-23) on the consolidated `shipments` table --
+8 sources, 156 files -- read with Spark 3.5.3 + Delta 3.2.1, the engine
+Databricks runs:
+
+- **497,650 rows**, and a per-source breakdown matching every source exactly.
+- Filtering to one source returned **70,699** rows, matching that source --
+  partition pruning works off `partitionValues`.
+- Cross-checked against the Iceberg side of the same table: both return
+  497,650 rows and total `freight_cost` of **3,736,170,232.47**. Identical.
+- The physical Parquet has 31 columns and does not contain
+  `source_connection_id`; the Delta schema declares 32 and supplies the last
+  from the log. Confirmed by reading a spliced file's footer.
+
+**The interesting finding is that Delta is structurally *easier* here than
+Iceberg**, which inverts the usual expectation. Delta resolves columns by
+NAME, so the entire field-id collision problem -- the reserve / widen /
+rewrite machinery, and the base-schema divergence bug a customer hit -- is
+not reachable with column mapping off. And a Delta partition column is
+*expected* to be absent from the data files and supplied by the log, which
+is exactly this tool's situation; Iceberg needed a reserved out-of-band
+field id and a two-step create-then-widen dance for the same effect.
+
+Protocol is deliberately the permissive floor, `minReaderVersion 1 /
+minWriterVersion 2`, not inherited from what MDLS emits. Reader v1 means no
+column mapping, which is the point: `id` mode would resolve by Parquet field
+id and drag the Iceberg hazard straight into the Delta path. Everything
+above the floor assumes Delta owns the data layout, which it does not here.
+
+Known limits, all documented: the table is **read-only by construction** (an
+INSERT or OPTIMIZE would desynchronise the two views); **delta-rs 1.6.5
+cannot read it** (treats absolute `add.path` as relative -- Spark and
+Databricks are fine); it is a **point-in-time snapshot** that
+`register_consolidation.py` does not update; stats are `numRecords` only, so
+no min/max skipping; and source-side compaction or `VACUUM` breaks it the
+same way it breaks the Iceberg side.
+
+
 ### Customer report: field-id order divergence -- already fixed, but expensive and unsignposted
 
 A customer running this tool against their Fivetran MDLS lake reported

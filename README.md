@@ -229,6 +229,20 @@ transformation, deduplication across sources, or a canonical schema that
 differs in shape from every source's native schema, keep using dbt or a
 real merge job.
 
+## Delta Lake support (experimental)
+
+Iceberg is this project's primary path. For Databricks customers there is a
+secondary one: `scripts/generate_delta_log.py` emits a Delta Lake
+`_delta_log` over the **same** consolidated data files, giving two
+independent metadata layers over one set of Parquet -- Iceberg for
+Snowflake/Trino, Delta for Databricks, no bytes copied.
+
+Validated end to end with Spark 3.5.3 + Delta 3.2.1 against the live lake:
+identical row counts and aggregates from both the Iceberg and Delta sides of
+the same consolidated table. It is experimental, read-only by construction,
+and has real caveats -- read
+[docs/DELTA_LAKE_SUPPORT.md](docs/DELTA_LAKE_SUPPORT.md) before using it.
+
 ## Vended credentials: what's actually confirmed
 
 This was validated two different ways, and it's worth being precise about
