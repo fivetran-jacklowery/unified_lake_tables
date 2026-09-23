@@ -29,9 +29,9 @@ every id another source might reuse for a different column was already
 "known," so nothing was flagged and the files were spliced in by reference.
 **The first action for this customer is to upgrade.**
 
-**Reproduced, then confirmed fixed.** Built `fixtures/connectors/synth_order_01`
-and `_02`: identical table, identical column names, identical types, only
-the declaration ORDER differs -- so field id 2 is `clicks` (long) in one and
+**Reproduced, then confirmed fixed,** with two purpose-built sources:
+identical table, identical column names, identical types, only the column
+DECLARATION ORDER differs -- so field id 2 is `clicks` (long) in one and
 `ctr` (double) in the other, and field id 3 is the reverse. Values were
 chosen disjoint (`clicks` 1000..9999, `ctr` 0.0..1.0) so a crossed id is
 unmistakable. On current HEAD the disagreement is detected, the divergent
@@ -213,9 +213,8 @@ colliding field id, that source's rows land in the target N times over and
 
 **The reproduction.** Nothing existing could trigger this -- the eight
 `synth_src_changing_*` fixtures are byte-identical by construction, so they
-never collide. Built a purpose-built two-source fixture instead, at
-`fixtures/connectors/synth_collide_01` and `_02`. Both declare an
-identical 9-column base table `widgets`, then
+never collide. Built two purpose-built sources instead. Both declare an
+identical 9-column base table, then
 each grows ONE new column with a different name -- `alpha_metric` in 01,
 `beta_flag` in 02 -- which is emitted as an undeclared extra key on the
 second sync, the way real source drift actually arrives. Because both
