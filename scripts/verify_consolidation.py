@@ -56,6 +56,8 @@ from register_consolidation import (
 )
 from pyiceberg.catalog.rest import RestCatalog
 
+from multi_source_io import MultiSourceFileIO
+
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(message)s",
@@ -88,7 +90,18 @@ def verify_table(cat, table_name: str, source_namespaces: list, target_namespace
         sources_checked += 1
         src_table = cat.load_table(src_id)
         source_row_count = src_table.scan().to_arrow().num_rows
-        target_row_count = target_table.scan(row_filter=f"{source_id_column} = '{ns}'").to_arrow().num_rows
+
+        # Same cross-namespace credential gap register_consolidation.py's
+        # idempotency check has (see multi_source_io.py's docstring): these
+        # rows were spliced in by reference and still physically live under
+        # NS's own storage location, which the target table's own vended
+        # credential doesn't cover.
+        original_io = target_table.io
+        target_table.io = MultiSourceFileIO([target_table.io, src_table.io])
+        try:
+            target_row_count = target_table.scan(row_filter=f"{source_id_column} = '{ns}'").to_arrow().num_rows
+        finally:
+            target_table.io = original_io
         total_target_rows += target_row_count
         if source_row_count != target_row_count:
             logger.error(

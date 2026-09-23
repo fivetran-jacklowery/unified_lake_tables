@@ -33,6 +33,57 @@ splicing, schema-drift detection and resolution, idempotency) — you'll want
 that context to explain what's happening to whoever you're helping, and to
 recognize when something has gone wrong versus working as intended.
 
+## Hard constraint: source tables are READ-ONLY. Always. No exceptions.
+
+This overrides every other instruction in this skill. **Never modify a
+source table, in any way, for any reason.** Every write this toolkit
+performs goes to the **target** namespace and nowhere else.
+
+Permitted against a source table — the complete list:
+
+- `.scan()` (including `.to_arrow()`, `.plan_files()`)
+- `.schema()`
+- `.io` (borrowing its vended credential to read its own files)
+- `cat.load_table()`, `cat.list_tables()`, `cat.list_namespaces()`,
+  `cat.table_exists()`
+
+Forbidden against a source table — not an exhaustive list, because the rule
+is "anything that isn't a read":
+
+- `append`, `overwrite`, `delete`, `upsert`, any `transaction()`
+- `update_schema`, `add_column`, `rename_column`, `update_spec`
+- `create_table`, `drop_table`, `register_table`, renaming or moving it
+- `expire_snapshots`, compaction, rewriting manifests, orphan-file cleanup
+- editing, redeploying, pausing or resyncing the Fivetran **connection**
+  that feeds it, in order to change what it lands
+
+Two reasons this is absolute, and the second one is the non-obvious one:
+
+1. These are the customer's system of record. This tool exists to avoid
+   touching their data; writing to a source would betray the entire premise.
+2. **It can silently break the consolidated table.** The target's manifest
+   points at the source's *physical Parquet files* by absolute path. Anything
+   that rewrites, compacts, or expires those files out from under it — which
+   ordinary Iceberg maintenance does — leaves the target referencing files
+   that no longer exist, and queries fail outright. A well-intentioned
+   "let me just tidy up this source" is one of the few ways to hard-break a
+   consolidated table. See `docs/BENCHMARKS.md` §4 and the CHANGELOG's
+   source-side compaction gap.
+
+If a task appears to require modifying a source — a bad column type, a
+column that needs renaming, data that needs cleaning, a source that needs
+compacting — **stop and say so.** That is a conversation to have with
+whoever owns that connection, not something to action from here. Propose it;
+never perform it.
+
+This invariant currently holds by construction: across
+`register_consolidation.py`, `verify_consolidation.py`, `bench_vs_union.py`
+and the Glue example, every mutating call's receiver is `target_table` (or a
+transaction on it), and source handles only ever receive `.scan()`,
+`.schema()` and `.io`. **If you change this code, preserve that property** —
+it is the safety guarantee, and it is worth re-checking with a quick grep
+for write calls whose receiver is not the target before you finish.
+
 ## Before doing anything: check whether this is actually a safe fit
 
 This is the single most important part of this skill. The technique here has

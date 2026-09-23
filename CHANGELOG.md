@@ -4,8 +4,282 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Customer report: field-id order divergence -- already fixed, but expensive and unsignposted
+
+A customer running this tool against their Fivetran MDLS lake reported
+(2026-09-22) that on a table whose sources assign field ids in **different
+orders**, the consolidated table returned **silently incorrect values** --
+metrics in the wrong columns, a float truncated to integers -- while the run
+reported success with 0 collisions, 0 warnings, and matching row counts.
+
+**Root cause: they were on `e6a2287`, three commits behind.** The guard that
+catches this landed in `e1650c1` ("Fix silent field-id collision
+misattribution"), which added the comparison of each source's OWN name for a
+field id against the target's registered name:
+
+```python
+src_field = src_schema.find_field(field_id) if src_schema else None
+if src_field is not None and src_field.name != target_name:
+    return field_id
+```
+
+Before `e1650c1`, `file_has_drift_beyond()` only flagged ids the target did
+not know *at all*. Since the target is seeded from `source_namespaces[0]`,
+every id another source might reuse for a different column was already
+"known," so nothing was flagged and the files were spliced in by reference.
+**The first action for this customer is to upgrade.**
+
+**Reproduced, then confirmed fixed,** with two purpose-built sources:
+identical table, identical column names, identical types, only the column
+DECLARATION ORDER differs -- so field id 2 is `clicks` (long) in one and
+`ctr` (double) in the other, and field id 3 is the reverse. Values were
+chosen disjoint (`clicks` 1000..9999, `ctr` 0.0..1.0) so a crossed id is
+unmistakable. On current HEAD the disagreement is detected, the divergent
+source is routed through the rewrite path, and the values land **correct**
+for both sources; a second run is a clean no-op.
+
+**What was still wrong: the cost is invisible.** Because a file's field ids
+are baked into its Parquet footer, rewriting is the only way to make a
+divergent source safe -- so it gets **0 files spliced and 100% of its rows
+physically rewritten**, reported as an ordinary "collision." For base-schema
+divergence across many sources that is an enormous first run that forfeits
+the no-rewrite premise, and nothing said so beforehand.
+
+Added a pre-flight check, `find_field_id_disagreements()`, run before the
+target is created (the per-source schema/file load was reordered ahead of
+target creation to make it a true pre-flight, and is now reused rather than
+re-fetched). It **warns, it does not abort** -- the run is correct either
+way, and refusing would regress behavior that works.
+
+It also distinguishes the two cases by measuring rather than assuming, since
+they look identical in the schema but have very different bills: it counts
+how many of the divergent source's files actually carry data for a contested
+id. Base-schema divergence hits ~100% of files and gets the loud warning
+with a per-source file-count table; ordinary drift hits only recent files
+and gets a one-line INFO noting the routine collision path will handle it at
+normal cost. Verified both ways: `synth_order_02` 4/4 files (100%) → full
+warning; `synth_collide_02` 7/11 (64%) → quiet INFO, no alarm.
+
+Also fixed a misleading diagnostic on this path. When a divergent source's
+column already exists because ANOTHER source contributed it, the rewrite
+step asserted the rarer explanation as fact -- "looks like a leftover from
+an interrupted run from BEFORE the atomic-commit fix" -- sending whoever
+reads the log hunting a failure that never happened. It now names both
+possibilities and which is the common one.
+
+Regression-checked the uniform-schema path (8 `synth_src_changing_*` sources):
+silent on disagreements, 11 files / 5,772 rows spliced, 0 rewritten, and a
+clean `verify_consolidation.py` across all 8 sources.
+
+### Measured: a `UNION ALL` view prunes too -- the original pitch was wrong
+
+Measured 2026-09-22 against the live Polaris catalog and DuckDB 1.5.5, on
+`shipments` across the eight `synth_src_changing_*` sources. Full numbers,
+methodology and caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md);
+reproduce with the new `scripts/bench_vs_union.py`.
+
+The README asserted, without measurement, that a `UNION ALL` view
+"re-scans every source's full data on every single query." **That is false
+against a competent optimizer.** Each union branch tags rows with a literal
+source id, and DuckDB constant-folds that literal and eliminates the
+branches that cannot match a filter on it -- the filtered union's plan
+collapses to a single `READ_PARQUET` node, 1 of 8 sources. It prunes
+exactly as well as this tool's identity partition does.
+
+Two related claims also have to go, one of them structural:
+
+- **Data-scan cost cannot differ, ever.** No-rewrite consolidation points
+  the target manifest at the *same physical Parquet files* the union reads.
+  Same bytes, same row groups. No "we read less data" claim about this
+  technique can be true.
+- Filtering on any column *other* than the source id gives neither approach
+  an advantage; both read everything.
+
+**What survives, and is still a strong argument: planning cost.** 672 ms vs
+7,567 ms unfiltered (**11.3x**), 305 ms vs 894 ms filtered. The union issues
+8 `loadTable` calls and traverses 8 manifest trees where the consolidated
+table issues one -- and that gap grows roughly linearly with source count,
+so at 400 tenants it dominates. Identity-partition pruning itself works as
+designed (22/145 files, 14.2% of rows).
+
+Caveat: **DuckDB is not Snowflake.** Whether Snowflake folds union-branch
+literals the same way is untested; confirm before repeating this to a
+customer on Snowflake. README positioning updated accordingly.
+
+### Confirmed: Fivetran's Polaris supports Iceberg views, but denies `CREATE_VIEW`
+
+Investigated 2026-09-22 as a possible alternative to manifest splicing: let
+the catalog hold a `UNION ALL` view instead of building a consolidated
+table. A view references *tables*, not files, so it would be immune to the
+source-side compaction gap below, and it would sidestep the field-id
+collision problem entirely (SQL resolves columns by name at query time).
+
+The catalog advertises the **complete** Iceberg view API in its `/config`
+response -- create, replace, list, load, exists, drop, rename. Read-side
+operations all work: `list_views`, `view_exists`, `load_view` and
+`drop_view` return proper Iceberg semantics (`NoSuchViewError`, not a
+permission error). But `create_view` fails:
+
+```
+ForbiddenException: Principal 'customer_..._user' with activated
+PrincipalRoles '[]' and activated grants via
+'[..._catalog_manager, ..._user_role]' is not authorized for op CREATE_VIEW
+```
+
+Denied **catalog-wide** (tried four namespaces including the target and a
+source). The control case pins it down: the same principal can `create_table`
+and `drop_table` in the very same namespace, so this is not a general write
+restriction -- it is specifically the missing `CREATE_VIEW` grant.
+
+So views are a **grant change, not an architecture change**. Given the
+principal naming this is likely the standard MDLS customer role rather than
+anything account-specific, which would make it a product decision. Needs
+confirmation with whoever owns Polaris grants.
+
+Note this also requires **pyiceberg 0.12.0** -- view CRUD is not in the
+pinned 0.11.1 (which has only one of the three methods).
+
+### Confirmed: upstream pyiceberg changes that affect this tool
+
+Reviewed `apache/iceberg-python` main at `0d584073` (2026-09-18), 86 commits
+past the previously-reviewed `68898e5a`. All findings below are
+**unreleased** -- 0.12.0 shipped 2026-08-22, before these landed -- so
+nothing bites at the pinned 0.11.1 today. Three change the ground under the
+pin and must be re-validated before any upgrade:
+
+- **`DEFAULT_READ_VERSION` flipped 2 -> 3** (#3690). `register_consolidation.py`
+  calls `DataFile.from_args(...)` with no `_table_format_version`, so it
+  binds `DATA_FILE_TYPE[DEFAULT_READ_VERSION]` -- now the V3 struct, which
+  gains four trailing fields (`first_row_id`, `referenced_data_file`,
+  `content_offset`, `content_size_in_bytes`), taking the record from 16
+  slots to 20. Upstream intends this to be transparent (writers project the
+  canonical record down to the target's version), but this is exactly the
+  "a pyiceberg upgrade could silently change this behavior" scenario
+  `requirements.txt` already warns about. Applies to the Glue example too.
+- **The `spec_id=` kwarg has always been a silent no-op** (#3954). Verified
+  against the `pyiceberg-0.11.1` tag: `spec_id` is not a field of
+  `DATA_FILE_TYPE` (it is a separate `_spec_id` slot with a property
+  setter), and 0.11.1's `Record._bind` silently drops unrecognized kwargs.
+  So `spec_id=target_table.spec().spec_id` at `register_consolidation.py`
+  sets nothing. Harmless: the write path never reads `data_file.spec_id`
+  (only `_deleted_data_files` does, at `snapshot.py:214,264`, and orphans
+  come from `plan_files()` where `manifest.py:1084` already populated it).
+  On main it becomes a real keyword-only parameter *and unknown kwargs now
+  raise `TypeError`* -- the silent-ignore safety net is gone.
+- **Decimal scale promotion is broken in 0.11.1 AND 0.12.0** (#3613, #3985).
+  `pyiceberg/schema.py`'s `promote()` for `DecimalType` reads
+  `file_type.scale == file_type.scale` -- a self-comparison, always true --
+  so a promotion that *changes the scale* is accepted and values come back
+  off by powers of ten. Fixed only on main. **This matters here
+  specifically:** `file_has_drift_beyond()` keys on field id plus *name*, so
+  a source evolving `decimal(10,2)` -> `decimal(12,4)` on the same field id
+  with the same name is not drift by this tool's definition, gets spliced
+  straight in, and the read then leans on the broken `promote()`. That is
+  the same silent-wrong-data failure this project exists to prevent, one
+  layer below where it currently looks. Not yet reproduced live.
+
+Also available and worth adopting, unrelated to risk:
+
+- **REST client retry/timeout** (#3418), new opt-in `rest.client.*` catalog
+  properties: `connection-timeout-ms`, `socket-timeout-ms`, `max-retries`,
+  `retry-backoff-factor`. The upstream commit is explicitly motivated by
+  "a Polaris instance returning 504 from a proxy." This tool currently runs
+  threaded per-namespace `RestCatalog` work with no timeout and no retries,
+  so an indefinite hang is possible today. Fully opt-in: absent all four
+  properties `_create_connection_adapter` returns `None` and behavior is
+  unchanged. Retries cover idempotent verbs on transient 5xx and still
+  surface typed exceptions (`ServiceUnavailableError`) on exhaustion.
+
+Good news: **`_last_column_id` and `Transaction._append_snapshot_producer`
+are both untouched** on main -- no commit in that range modified
+`table/update/schema.py` at all, so the reserved-field-id trick still holds.
+
+### Fixed: collision rewrite appended one duplicate copy per drifted file
+
+Found by reading and then **reproduced live against real infrastructure**,
+2026-09-22. In `register_consolidation.py`'s step 4 rewrite pass:
+
+```python
+for f in to_rewrite:
+    tab = src_table.scan(row_filter=f"{name} is not null").to_arrow()
+```
+
+The loop variable `f` is never used in the body. The scan covers the
+**whole source table** and is re-run identically on each iteration, so
+`tabs` ends up holding `len(to_rewrite)` identical copies, and the loop
+below appends every one of them. With 2+ drifted files for a single
+colliding field id, that source's rows land in the target N times over and
+`rewritten_rows` reports N times the true count.
+
+**The reproduction.** Nothing existing could trigger this -- the eight
+`synth_src_changing_*` fixtures are byte-identical by construction, so they
+never collide. Built two purpose-built sources instead. Both declare an
+identical 9-column base table, then
+each grows ONE new column with a different name -- `alpha_metric` in 01,
+`beta_flag` in 02 -- which is emitted as an undeclared extra key on the
+second sync, the way real source drift actually arrives. Because both
+tables sit at the same highest field id when the new column lands, both
+new columns take **field id 12**, with different names. That is the
+collision. Sync 1 lands 20,000 rows with no drift column; sync 2 lands
+25,000 rows all carrying it, which the writer spread over **7 files**.
+
+Measured, first run, before the fix:
+
+```
+COLLISION at field_id=12: 'alpha_metric' already owns it,
+  'synth_collide_02'.'beta_flag' needs a fresh field id + rewrite
+synth_collide_02: 4 file(s) spliced in, 20000 rows (7 pending physical rewrite)
+rewrite: 'beta_flag' (from synth_collide_02) field_id=100001,
+  175000 row(s) rewritten + appended
+```
+
+175,000 where 25,000 was correct -- an exact **7x**, one copy per file in
+`to_rewrite`. Target-side: `synth_collide_02` held 195,000 rows (20,000
+correctly spliced + 175,000 duplicated) against a 45,000-row source, while
+`synth_collide_01` was correct at 45,000.
+
+**The fix.** Not "use `f`" -- that single scan already returns every drifted
+row across all of the source's files, so the loop was simply redundant and
+collapses to one scan. `to_rewrite` still decides *whether* there is
+anything to rewrite and how many rows to expect. After the fix, rebuilt
+from scratch: 25,000 rows rewritten, both sources exactly 1.00x, and the
+run dropped from **23.6s to 8.8s** (six redundant whole-table scans gone).
+A third run is a clean no-op (0 spliced, 0 rewritten, 0 orphaned), so
+idempotency still holds through the collision path.
+
+Note `verify_consolidation.py`'s duplicate-file check would **not** have
+caught this -- each append writes a new, distinct file path, so there is no
+duplicated path to find. Its row-count check does catch it, and did.
+
+Residual, not reproduced: the skip guard compares `already_rewritten`
+(rows where the column is non-null) against `expected_rows` (the full
+`record_count` of every drifted file). Those are the same number only when
+drifted files contain nothing but drifted rows, which was true here. A file
+mixing null and non-null values for the new column could make the guard
+compare mismatched quantities.
+
 ### Added
 
+- **`SKILL.md`: an explicit, overriding read-only invariant on source
+  tables.** Source tables may only ever be read (`.scan()`, `.schema()`,
+  `.io`, and the catalog's list/exists/load calls); every write goes to the
+  target namespace. The skill now enumerates what is permitted and what is
+  forbidden, states that a task appearing to need a source modification must
+  be *proposed, never performed*, and gives the non-obvious reason this is
+  absolute: the target's manifest points at the sources' physical Parquet
+  files by absolute path, so ordinary source-side maintenance (compaction,
+  snapshot expiry, orphan cleanup) leaves the target referencing files that
+  no longer exist and queries fail outright. Verified that the invariant
+  currently holds by construction -- across `register_consolidation.py`,
+  `verify_consolidation.py`, `bench_vs_union.py` and the Glue example, every
+  mutating call's receiver is `target_table` or a transaction on it, and
+  source handles only ever receive `.scan()`, `.schema()` and `.io`.
+- `scripts/bench_vs_union.py` -- measures planning cost, per-source
+  staleness, and (with `--with-duckdb`) whether a real optimizer prunes
+  `UNION ALL` branches on the literal source id. Reuses
+  `register_consolidation.py`'s config/credential plumbing so it cannot
+  drift from how the tool actually authenticates. Backs
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 - **Pattern-based source namespace discovery.** `config.yaml` now accepts
   `source_namespace_pattern` (a glob, e.g. `"tenant_*"`) as an alternative to
   hand-enumerating `source_namespaces`, resolved against the catalog's real
@@ -109,6 +383,44 @@ scoping for cross-namespace manifests is resolved upstream or worked around
 in this tool directly. **Not yet changed in the script itself** -- this is
 documentation of a real, reproduced gap and a validated workaround, not a
 code fix.
+
+### Fixed: the ACCESS_DENIED gap above, in the script itself
+
+New `scripts/multi_source_io.py`: a `MultiSourceFileIO` that wraps a
+table's own `FileIO` alongside one or more other tables' `FileIO`
+instances (each carrying that table's own vended credential), and tries
+each in turn to open a given file -- caching which one worked per storage
+prefix so repeat opens of the same source's files don't retry every
+candidate. `Table.io` turned out to be a plain settable attribute
+(`self.io = io` in `pyiceberg.table.Table.__init__`, confirmed by reading
+the installed 0.10.0 source) that `Table.scan()` reads fresh on every call
+(`DataScan(..., io=self.io, ...)`), so both fixed call sites work by
+temporarily swapping `target_table.io` for a `MultiSourceFileIO` built from
+`[target_table.io, src_table.io]` around just the one scan that needs
+cross-namespace reads, then restoring the target's own IO immediately
+after -- writes always go through the target's own credential, unaffected.
+
+Applied to both places this same root cause showed up:
+`register_consolidation.py`'s collision-rewrite idempotency check (the
+exact crash reproduced above), and `verify_consolidation.py`'s per-source
+row-count check (the "same root cause... but [less severe]" instance this
+entry's own writeup pointed to).
+
+Verified live against the same sandbox catalog and the same `warehouses`
+collision that originally crashed: re-running `register_consolidation.py`
+completed the previously-pending rewrite (1 file, 50 rows) with no error,
+and a subsequent `verify_consolidation.py` run passed all checks (row
+counts, duplicate-file check, partition-pruning check) for all 15 tables,
+`warehouses` included (452,499 total rows across 8 sources, all matching
+source counts exactly). The `MultiSourceFileIO` fallback/caching logic was
+also unit-tested standalone against fake `FileIO`s simulating this exact
+failure mode before the live re-run.
+
+Note: this fixes the two call sites that actually hit the bug today. It is
+not a general "any reader can see any file in this catalog" credential
+model -- a future cross-namespace read added somewhere else would need the
+same treatment (wrap the relevant tables' `FileIO`s) rather than assuming
+this is fixed globally.
 
 ### Fixed: copy-on-write updates/deletes were silently duplicating and resurrecting rows
 
@@ -347,6 +659,150 @@ resolving newly-drifted ids -- a different, larger piece of work than the
 baseline fix above, and not undertaken here. Left as an open, clearly
 documented gap (see README.md's "What this does NOT yet handle" and
 Troubleshooting sections) rather than silently declared handled.
+
+### Fixed: silent field-id collision misattribution
+
+Reproduced live (not hypothetical), against the exact `warehouses` /
+`synth_src_changing_03` / `synth_src_changing_04` collision this project's
+own prior entries above already describe: after the ACCESS_DENIED fix let
+the collision-rewrite path's idempotency check run without crashing, a
+subsequent run of `register_consolidation.py` against a real customer-style
+target (`demo_ns.warehouses`, built via an external VS Code integration
+attempt) left `synth_src_changing_03`'s 50 `loading_dock_type` rows silently
+readable as `dock_supervisor_name` instead -- no error, no warning, wrong
+data. Root cause was a real gap in `file_has_drift_beyond()`, not the
+ACCESS_DENIED path: it only ever checked whether a field id was *present* in
+`known_field_ids`, never whether the target's registered *name* for that id
+agreed with what the file's own source calls it. Two distinct ways this bit
+us, both reproduced directly:
+
+1. **Day one, no interruption needed at all.** `create_target_table()` seeds
+   the target's starting schema from `source_namespaces[0]`'s full schema,
+   so a field id source #1 already happens to use is "known" from table
+   creation -- before drift-detection is ever called for any OTHER source's
+   files. A second source landing a differently-named column on that same
+   numeric id (routine for independently-evolving sources, since each
+   starts counting from its own schema's next free id) was never flagged as
+   drift and got silently spliced in under source #1's name for that id.
+   Reproduced against two disposable two-source test tables with no
+   interruption of any kind -- a clean, uninterrupted first run mislabels
+   the data.
+2. **An interrupted collision-rewrite** (the scenario this project's own
+   prior entries assumed was the only risk here): the "owner" name for a
+   colliding id is committed as soon as the collision is first detected,
+   independently of whether the *losing* source's rewrite (a separate,
+   later commit under the old two-commit design) ever completes. If that
+   rewrite is interrupted after its schema-evolution commit but before its
+   data-append commit, a rerun sees the id as "known" from the owner's
+   already-committed widening and never re-flags the loser's still-
+   unresolved file, even though its rewrite never actually happened. This
+   is what happened to `demo_ns.warehouses` in practice.
+
+**The fix**, in `file_has_drift_beyond()`: compare the file's own source's
+name for a field id (via that source's live schema) against the target's
+registered name for the same id, not just whether the id is present.
+`known_field_ids` (a set) became `known_field_names` (a `{field_id: name}`
+dict) threaded through all three call sites. A name mismatch is still-
+unresolved drift regardless of whether the id itself is otherwise "known."
+
+This also required fixing the widening step in `register_table()`: it used
+to assume the first distinct name seen in a given run could always freely
+claim a drifted field id (`if owner_name not in already_field_names`), which
+is only safe if the target doesn't *already* have a different name
+registered for that exact id. With the corrected drift-detection now
+catching the day-one scenario too, the target frequently already has a name
+for the id in play (seeded at creation, per case 1 above) -- and Polaris
+correctly rejects a schema-evolution commit that tries to claim an id the
+target's schema already uses for something else (`HTTP 400 Bad Request`,
+reproduced live while validating this fix). Fixed by checking
+`known_field_names` for an existing name first: if the target already has
+one, that name is the true owner outright and *every* distinct name seen
+this run goes through the rewrite path, not just "everyone after the
+first."
+
+Verified end-to-end against disposable two-source test tables (day-one
+scenario: clean first run now correctly detects and resolves the collision
+instead of mislabeling; three consecutive runs settle into a stable,
+correct, zero-churn steady state) and against the real, already-corrupted
+`demo_ns.warehouses`: removed the single 50-row culprit manifest entry
+(identified via its file-level `null_value_counts`, which pinpointed the
+exact physical file down to its record count matching the known-bad row
+count), then reran the fixed script, which correctly re-detected the
+collision and re-derived the 50 rows under `loading_dock_type` -- confirmed
+via a cross-namespace scan (`MultiSourceFileIO`) that `synth_src_changing_03`
+now shows 0 rows under `dock_supervisor_name` / 50 under `loading_dock_type`,
+while `synth_src_changing_04`'s legitimately-owned 40 `dock_supervisor_name`
+rows were untouched throughout.
+
+### Fixed: the collision-rewrite path's two commits weren't atomic
+
+Companion fix to the misattribution bug above, closing the actual
+interruption window rather than just detecting its aftermath more
+correctly. Before this, `register_table()`'s rewrite pass committed a
+drifted column's schema evolution (`add_column`) as one standalone commit,
+then appended each drifted file's data as one or more *separate* commits
+after it -- real physical writes, not the cheap no-rewrite splice path, so
+there was a real window between them where the process could be
+interrupted, crash, or lose its network connection with the schema change
+durable and the data not.
+
+**The fix:** wrap the schema evolution (when the column is new) and every
+file's data append for a given collision into one `pyiceberg`
+`Transaction` -- `Transaction.table_metadata` layers pending `update_schema`
+calls onto the in-progress metadata, so a subsequent `Transaction.append()`
+in the *same* transaction correctly resolves the not-yet-committed column,
+and `commit_transaction()` (called automatically on a clean `__exit__`)
+writes both as a single atomic snapshot. Confirmed directly (not just by
+reading `pyiceberg`'s source) against a disposable test table: raising an
+exception partway through an open `with table.transaction() as txn:` block
+-- after `txn.update_schema()` and one `txn.append()` had already run --
+left the catalog completely unchanged on read-back: no new column, no new
+rows, snapshot count unchanged. Either everything in the transaction lands,
+or nothing does.
+
+A run from *before* this fix can still have left a column registered with
+none of its data appended (exactly the `demo_ns.warehouses` case above).
+The rewrite pass now checks for that explicitly rather than assuming
+"column exists" always means "fully done": if the column already exists but
+an idempotency-style row-count check finds fewer rows than expected, it logs
+a clear warning and appends the missing rows as a data-only commit (no
+schema change needed), self-healing the pre-fix state instead of silently
+leaving it broken.
+
+### Fixed: rewrite-path files were perpetually treated as copy-on-write orphans
+
+Found while verifying the two fixes above, not part of the original ask --
+a genuine rerun of the fixed script surfaced it immediately (an orphan
+retirement + rewrite churn cycle on every single run of a table with any
+resolved collision, which shouldn't happen). `already_registered_by_source()`
+returned every file registered under a source's partition, used both for
+the plain "already spliced, skip" check and for copy-on-write orphan
+detection (does this path still appear in the source's own current file
+listing). Those two checks need different inputs: a file created by the
+collision-rewrite path (`Transaction.append()`, see above) is a brand-new
+physical file written under the *target's own* storage location, not a
+splice-by-reference of a source file -- it will never appear in any
+source's own file listing, by construction, regardless of whether anything
+is wrong with it. Using the full set for orphan detection meant every
+rewritten/appended file got flagged as orphaned and deleted, then
+re-derived from scratch, on every subsequent run.
+
+**The fix:** `already_registered_by_source()` now returns
+`(by_source, spliced_by_source)` -- the second only includes files whose
+path doesn't start with the target table's own storage location, i.e.
+files still genuinely spliced in by reference from a source. The orphan-
+check loop in `register_table()`'s no-rewrite pass now uses
+`spliced_by_source` instead of the full set; the plain idempotency check
+(`already`) is unaffected and still uses the full set, since re-splicing an
+already-registered path is the thing it's guarding against regardless of
+which mechanism registered that path.
+
+Verified directly: three consecutive runs against the same disposable
+two-source collision test table now show 0 orphaned files retired and 0
+rows rewritten on runs 2 and 3 (previously, run 2 alone deleted and
+re-appended the rewritten file's data), and the table's snapshot count
+stayed at 2 across all three runs (the two commits from run 1; nothing
+added by the no-op reruns).
 
 ## [1.0.0]
 
