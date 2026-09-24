@@ -1,5 +1,12 @@
 # unified-lake-tables
 
+## Disclaimer
+
+This repository is provided as a reference implementation to help users
+better understand and work with Fivetran automations. It is intended as a
+starting point for custom solutions that may require additional design,
+hardening, or scaling for enterprise use.
+
 > A note on the name: "unified-lake-tables" is just what this capability is
 > called in this repo right now -- it isn't an officially locked-in Fivetran
 > product name. Rename the directory, the package, whatever you like; nothing

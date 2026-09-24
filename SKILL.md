@@ -33,6 +33,19 @@ splicing, schema-drift detection and resolution, idempotency) — you'll want
 that context to explain what's happening to whoever you're helping, and to
 recognize when something has gone wrong versus working as intended.
 
+## Disclaimer
+
+This repository is provided as a reference implementation to help users
+better understand and work with Fivetran automations. It is intended as a
+starting point for custom solutions that may require additional design,
+hardening, or scaling for enterprise use.
+
+Say this plainly to whoever you are helping before a first run against
+anything that matters, rather than letting them infer production-readiness
+from the fact that it works. The README's "What this does NOT yet handle"
+section and the CHANGELOG's out-of-scope list are the specifics behind that
+sentence — several are live gaps, not hypotheticals.
+
 ## Hard constraint: source tables are READ-ONLY. Always. No exceptions.
 
 This overrides every other instruction in this skill. **Never modify a
