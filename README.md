@@ -18,12 +18,8 @@ Fivetran connections are split up) into a single queryable table per table
 type, on a Fivetran-managed Polaris catalog and Managed Data Lake Service
 (MDLS) destination, without rewriting any of the underlying data.
 
-See [`docs/REFERENCE_ARCHITECTURE.md`](docs/REFERENCE_ARCHITECTURE.md) for
-the end-to-end diagram, or the
-[full slide deck](https://docs.google.com/presentation/d/1zie3Rp3qcVEms50A7C_RiJgRVx-RGG2Z4xZ9JqbWg8U/edit)
-this was pitched and explained from. For a short, customer-facing explainer
-on why this beats a `UNION ALL` view or a materialized merge job, see
-[`docs/customer-one-pager.pdf`](docs/customer-one-pager.pdf).
+See [`docs/HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md) for the mechanism and
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for what it measurably buys you.
 
 ## What this does, and why
 
