@@ -26,7 +26,6 @@ env/
 # Logs / local run artifacts
 *.log
 .pytest_cache/
-docs/images/.trash_slide05
 
 # Lambda example build output -- built locally by examples/aws-lambda/build.sh,
 # never committed (this is a full pyiceberg/pyarrow install, ~200MB+).
