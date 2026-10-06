@@ -435,7 +435,16 @@ of this same check.
 `register_consolidation.py` never asks for or constructs an AWS access
 key/secret. `catalog_properties()` builds only Polaris OAuth
 client-credentials properties (`uri`, `warehouse`, `credential`, `scope`,
-optionally `oauth2-server-uri`) for pyiceberg's `RestCatalog`.
+`oauth2-server-uri`) for pyiceberg's `RestCatalog`.
+
+Those OAuth credentials must be the **write-capable** pair. Fivetran
+exposes two per MDLS destination: the *catalog integration* tab's are
+read-only, while **"Write Credentials"** — issuing them requires
+destination admin — are what this tool needs, since it creates a namespace
+and registers tables. The distinction is invisible until it bites: a
+read-only pair authenticates and lists tables perfectly well, so
+`verify_consolidation.py` succeeds and `register_consolidation.py` fails at
+its first write.
 
 Confirmed by reading pyiceberg 0.11.1's own source
 (`pyiceberg/catalog/rest/__init__.py`): `RestCatalog` sends the
@@ -459,14 +468,18 @@ to flip in this codebase.
 Two sharp edges worth knowing about, found by reading the same source
 rather than assumed:
 
-- **`oauth2-server-uri` fallback is deprecated.** If `POLARIS_TOKEN_URI`
-  (mapped to pyiceberg's `oauth2-server-uri` property) is left unset,
-  pyiceberg 0.11.1 falls back to deriving a token endpoint from the catalog
-  URI, but its own source explicitly logs this as deprecated behavior
-  scheduled for removal in a future release (see the `_warn_oauth_tokens_deprecation`
-  method and its message referencing
+- **`oauth2-server-uri` fallback is deprecated**, so we never reach it.
+  Left to itself, pyiceberg 0.11.1 derives a token endpoint from the catalog
+  URI when `oauth2-server-uri` is unset, and its own source logs that as
+  deprecated behavior scheduled for removal (see the
+  `_warn_oauth_tokens_deprecation` method and its message referencing
   [apache/iceberg#10537](https://github.com/apache/iceberg/issues/10537)).
-  Set `POLARIS_TOKEN_URI` explicitly; don't rely on the fallback.
+  `catalog_properties()` therefore always passes `oauth2-server-uri`
+  explicitly, deriving it in `token_uri_for()` as
+  `<POLARIS_CATALOG_URI>/v1/oauth/tokens` -- where Polaris serves it. That
+  is one less value for a user to supply and one less deprecation to inherit.
+  `POLARIS_TOKEN_URI` still overrides the derived value if a deployment ever
+  terminates OAuth off the catalog host.
 - **No built-in refresh of vended storage credentials on expiry.** pyiceberg's
   OAuth *bearer token* (used to talk to the catalog itself) refreshes
   proactively with a margin before expiry (see `pyiceberg/catalog/rest/auth.py`).

@@ -26,6 +26,35 @@ CloudWatch Logs -- the managed `AWSLambdaBasicExecutionRole` policy is
 sufficient. There is no S3 policy to write, because there's no static AWS
 credential in this picture to scope one to.
 
+**Why this needs a build step at all,** rather than pasting the script
+into the Lambda console editor: the handler and consolidation logic are
+only ~70KB of pure Python, and on their own they really would paste in
+fine. The dependencies are the problem. Lambda's Python runtime ships
+only the standard library and `boto3`, and gives you no way to add to it
+in place -- there's no network access during initialization and the
+filesystem is read-only outside `/tmp`, so `pip install` at runtime isn't
+an option. Every dependency has to be pre-built into the deployment
+package instead. `pyiceberg` pulls in `pyarrow`, which isn't Python at
+all but a thin wrapper over roughly 150MB of compiled Apache Arrow C++ --
+compiled separately for each OS, each CPU architecture, and each Python
+minor version.
+
+Everything awkward below follows from that one fact, and it's worth
+reading the rest of this file with it in mind:
+
+- **Docker** is involved only to guarantee those compiled binaries match
+  Lambda's Linux runtime and your function's architecture. It has nothing
+  to do with the script itself.
+- **S3** is involved only because vendoring pyarrow pushes the package to
+  ~81MB, past Lambda's 50MB direct `--zip-file` upload cap.
+- **The trim step** in `build.sh` exists only because the package also
+  lands uncomfortably close to Lambda's 250MB unzipped ceiling.
+
+If that ceiling ever becomes the binding constraint, a container-image
+Lambda (`--package-type Image`) raises it to 10GB and removes the trim
+step, the size anxiety, and the S3 hop in one move -- at the cost of
+pushing to ECR instead. See "Step 1" below for when to make that call.
+
 ## Files here
 
 | File | Purpose |
@@ -145,11 +174,10 @@ aws lambda create-function \
   --timeout 300 \
   --memory-size 512 \
   --environment "Variables={
-    POLARIS_CATALOG_URI=https://your-polaris-catalog-uri,
-    POLARIS_WAREHOUSE=your_warehouse,
+    POLARIS_CATALOG_URI=https://random-words.us-east-1.aws.polaris.fivetran.com/api/catalog,
+    POLARIS_WAREHOUSE=easier_undertaken,
     POLARIS_CLIENT_ID=your_client_id,
     POLARIS_CLIENT_SECRET=your_client_secret,
-    POLARIS_TOKEN_URI=https://your-token-endpoint,
     TARGET_NAMESPACE=consolidated,
     SOURCE_NAMESPACE_PATTERN=tenant_*,
     SOURCE_ID_COLUMN=source_connection_id,
@@ -163,11 +191,11 @@ Environment variables this function reads (see `lambda_function.py`'s
 
 | Variable | Required | Notes |
 |---|---|---|
-| `POLARIS_CATALOG_URI` | yes | Same as `.env`'s `POLARIS_CATALOG_URI` in the CLI setup. |
-| `POLARIS_WAREHOUSE` | yes | |
+| `POLARIS_CATALOG_URI` | yes | Same as `.env`'s `POLARIS_CATALOG_URI` in the CLI setup. Copy it from your data lake destination's details page. |
+| `POLARIS_WAREHOUSE` | yes | The destination's group id (a two-word id like `easier_undertaken`), which is also the Polaris catalog name. |
 | `POLARIS_CLIENT_ID` | yes | |
-| `POLARIS_CLIENT_SECRET` | yes | See "Beyond this example" below before using this in anything but a first test. |
-| `POLARIS_TOKEN_URI` | recommended | Same deprecation-avoidance reason as the CLI's `.env.example`. |
+| `POLARIS_CLIENT_SECRET` | yes | Must be from the **"Write Credentials"** pair, not the read-only catalog integration tab. See "Beyond this example" below before using this in anything but a first test. |
+| `POLARIS_TOKEN_URI` | no | Derived as `<POLARIS_CATALOG_URI>/v1/oauth/tokens`. Set it only to override that. |
 | `TARGET_NAMESPACE` | yes | |
 | `SOURCE_NAMESPACES` | yes, unless using the pattern below | Comma-separated (this is the one shape difference from `config.yaml`'s YAML list). Fine for a handful of sources. |
 | `SOURCE_NAMESPACE_PATTERN` | yes, unless using the explicit list above | A glob (`tenant_*`, not SQL `LIKE`) resolved against the catalog's real namespaces on every run -- use this instead of `SOURCE_NAMESPACES` once you have more sources than is reasonable to hand-list, or want new tenant namespaces picked up automatically without a config change. Set exactly one of these two, not both. The resolved list is always logged -- check CloudWatch Logs after a pattern-based run's first invoke to confirm it matched what you expected. |

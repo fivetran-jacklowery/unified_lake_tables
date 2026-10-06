@@ -69,6 +69,9 @@ fi
 echo "Copying handler and shared consolidation script ..."
 cp "$HERE/lambda_function.py" "$BUILD_DIR/"
 cp "$REPO_ROOT/scripts/register_consolidation.py" "$BUILD_DIR/"
+# register_consolidation.py imports this at module level -- without it the
+# package fails at Lambda cold start with ModuleNotFoundError.
+cp "$REPO_ROOT/scripts/multi_source_io.py" "$BUILD_DIR/"
 
 UNTRIMMED_SIZE=$(du -sh "$BUILD_DIR" | cut -f1)
 
