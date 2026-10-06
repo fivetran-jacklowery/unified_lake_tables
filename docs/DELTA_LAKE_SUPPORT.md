@@ -59,7 +59,7 @@ Measured 2026-09-23 against the live lake, on the consolidated `shipments`
 table (8 sources, 156 files, ~498k rows).
 
 Generated a single `_delta_log/00000000000000000000.json` (53,714 bytes) at
-`s3://lowery-fmdl/two/delta_unified/shipments/`, with 156 `add` actions
+`s3://<bucket>/<prefix>/delta_unified/shipments/`, with 156 `add` actions
 pointing at the sources' existing Parquet by absolute URI. Read it with
 **Spark 3.5.3 + Delta 3.2.1** — the engine Databricks runs:
 
