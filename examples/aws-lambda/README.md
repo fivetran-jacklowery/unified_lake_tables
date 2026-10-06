@@ -26,6 +26,35 @@ CloudWatch Logs -- the managed `AWSLambdaBasicExecutionRole` policy is
 sufficient. There is no S3 policy to write, because there's no static AWS
 credential in this picture to scope one to.
 
+**Why this needs a build step at all,** rather than pasting the script
+into the Lambda console editor: the handler and consolidation logic are
+only ~70KB of pure Python, and on their own they really would paste in
+fine. The dependencies are the problem. Lambda's Python runtime ships
+only the standard library and `boto3`, and gives you no way to add to it
+in place -- there's no network access during initialization and the
+filesystem is read-only outside `/tmp`, so `pip install` at runtime isn't
+an option. Every dependency has to be pre-built into the deployment
+package instead. `pyiceberg` pulls in `pyarrow`, which isn't Python at
+all but a thin wrapper over roughly 150MB of compiled Apache Arrow C++ --
+compiled separately for each OS, each CPU architecture, and each Python
+minor version.
+
+Everything awkward below follows from that one fact, and it's worth
+reading the rest of this file with it in mind:
+
+- **Docker** is involved only to guarantee those compiled binaries match
+  Lambda's Linux runtime and your function's architecture. It has nothing
+  to do with the script itself.
+- **S3** is involved only because vendoring pyarrow pushes the package to
+  ~81MB, past Lambda's 50MB direct `--zip-file` upload cap.
+- **The trim step** in `build.sh` exists only because the package also
+  lands uncomfortably close to Lambda's 250MB unzipped ceiling.
+
+If that ceiling ever becomes the binding constraint, a container-image
+Lambda (`--package-type Image`) raises it to 10GB and removes the trim
+step, the size anxiety, and the S3 hop in one move -- at the cost of
+pushing to ECR instead. See "Step 1" below for when to make that call.
+
 ## Files here
 
 | File | Purpose |
