@@ -229,6 +229,26 @@ def _require_env(name: str) -> str:
     return val
 
 
+def token_uri_for(catalog_uri: str) -> str:
+    """Derive the Polaris OAuth2 token endpoint from the catalog URI.
+
+    Polaris always serves the token endpoint at <catalog URI>/v1/oauth/tokens,
+    so there is nothing here for a user to look up or get wrong. Deriving it
+    also means we always pass oauth2-server-uri explicitly, which sidesteps
+    pyiceberg 0.11.x's own catalog-URI-derived fallback -- that fallback is
+    flagged deprecated in its source (catalog/rest/__init__.py) and is
+    scheduled for removal.
+
+    POLARIS_TOKEN_URI still overrides this, for a deployment that terminates
+    OAuth somewhere other than the catalog host. The VS Code extension sets
+    it explicitly, so it has to keep working.
+    """
+    override = os.environ.get("POLARIS_TOKEN_URI")
+    if override:
+        return override
+    return f"{catalog_uri.rstrip('/')}/v1/oauth/tokens"
+
+
 def catalog_properties() -> dict:
     """Build the RestCatalog property dict for Polaris OAuth
     client-credentials auth.
@@ -243,24 +263,14 @@ def catalog_properties() -> dict:
     automatically. That's the whole mechanism -- there's no separate
     "vended credentials mode" flag to flip.
     """
-    props = {
-        "uri": _require_env("POLARIS_CATALOG_URI"),
+    catalog_uri = _require_env("POLARIS_CATALOG_URI")
+    return {
+        "uri": catalog_uri,
         "warehouse": _require_env("POLARIS_WAREHOUSE"),
         "credential": f'{_require_env("POLARIS_CLIENT_ID")}:{_require_env("POLARIS_CLIENT_SECRET")}',
         "scope": os.environ.get("POLARIS_SCOPE", "PRINCIPAL_ROLE:ALL"),
+        "oauth2-server-uri": token_uri_for(catalog_uri),
     }
-    token_uri = os.environ.get("POLARIS_TOKEN_URI")
-    if token_uri:
-        props["oauth2-server-uri"] = token_uri
-    else:
-        logger.warning(
-            "POLARIS_TOKEN_URI is not set. pyiceberg will fall back to deriving an "
-            "OAuth2 token endpoint from POLARIS_CATALOG_URI, but pyiceberg 0.11.x "
-            "explicitly flags that fallback as deprecated and scheduled for "
-            "removal in a future release (see its own deprecation warning). Set "
-            "POLARIS_TOKEN_URI in .env to avoid this breaking later for no reason."
-        )
-    return props
 
 
 def _make_catalog() -> RestCatalog:

@@ -174,11 +174,10 @@ aws lambda create-function \
   --timeout 300 \
   --memory-size 512 \
   --environment "Variables={
-    POLARIS_CATALOG_URI=https://your-polaris-catalog-uri,
+    POLARIS_CATALOG_URI=https://abc123xyz7890-acc.us-east-1.aws.polaris.fivetran.com/api/catalog,
     POLARIS_WAREHOUSE=your_warehouse,
     POLARIS_CLIENT_ID=your_client_id,
     POLARIS_CLIENT_SECRET=your_client_secret,
-    POLARIS_TOKEN_URI=https://your-token-endpoint,
     TARGET_NAMESPACE=consolidated,
     SOURCE_NAMESPACE_PATTERN=tenant_*,
     SOURCE_ID_COLUMN=source_connection_id,
@@ -192,11 +191,11 @@ Environment variables this function reads (see `lambda_function.py`'s
 
 | Variable | Required | Notes |
 |---|---|---|
-| `POLARIS_CATALOG_URI` | yes | Same as `.env`'s `POLARIS_CATALOG_URI` in the CLI setup. |
+| `POLARIS_CATALOG_URI` | yes | Same as `.env`'s `POLARIS_CATALOG_URI` in the CLI setup. Account- and region-specific; copy it from the dashboard. |
 | `POLARIS_WAREHOUSE` | yes | |
 | `POLARIS_CLIENT_ID` | yes | |
 | `POLARIS_CLIENT_SECRET` | yes | See "Beyond this example" below before using this in anything but a first test. |
-| `POLARIS_TOKEN_URI` | recommended | Same deprecation-avoidance reason as the CLI's `.env.example`. |
+| `POLARIS_TOKEN_URI` | no | Derived as `<POLARIS_CATALOG_URI>/v1/oauth/tokens`. Set it only to override that. |
 | `TARGET_NAMESPACE` | yes | |
 | `SOURCE_NAMESPACES` | yes, unless using the pattern below | Comma-separated (this is the one shape difference from `config.yaml`'s YAML list). Fine for a handful of sources. |
 | `SOURCE_NAMESPACE_PATTERN` | yes, unless using the explicit list above | A glob (`tenant_*`, not SQL `LIKE`) resolved against the catalog's real namespaces on every run -- use this instead of `SOURCE_NAMESPACES` once you have more sources than is reasonable to hand-list, or want new tenant namespaces picked up automatically without a config change. Set exactly one of these two, not both. The resolved list is always logged -- check CloudWatch Logs after a pattern-based run's first invoke to confirm it matched what you expected. |
