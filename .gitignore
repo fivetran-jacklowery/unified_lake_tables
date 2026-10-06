@@ -34,3 +34,9 @@ examples/aws-lambda/build/
 
 # Stray renamed/temp scratch files from interactive debugging sessions.
 *.stale.*
+
+# Slide/diagram collateral built from these docs. The repo is deliberately
+# code-first -- prose in docs/*.md is the source of truth -- so rendered
+# decks and one-pagers stay local rather than being committed.
+docs/*.html
+docs/*.pdf
