@@ -78,18 +78,37 @@ logging.basicConfig(
 )
 logger = logging.getLogger("register_consolidation")
 
-# Deliberately clear any ambient AWS credentials/profile out of this
-# process's environment before pyiceberg or pyarrow ever look at it. This
-# tool is designed to run on Polaris-vended credentials only (see
-# catalog_properties() below); if vending ever silently fails to return
-# credentials for some reason, pyarrow's S3FileSystem falls back to its own
-# default AWS credential discovery (env vars, shared config, instance
-# role) rather than raising a clear error. Clearing these here means that
-# failure mode surfaces as a loud, immediate auth error instead of quietly
-# reading (or writing) through whatever ambient AWS identity happens to be
-# sitting in the environment the script runs in.
-for _var in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
-    os.environ.pop(_var, None)
+_AMBIENT_AWS_VARS = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+)
+
+
+def purge_ambient_aws_credentials() -> list[str]:
+    """Clear ambient AWS credentials/profile out of this process's
+    environment before pyiceberg or pyarrow ever look at it, and return the
+    names of whatever was actually removed.
+
+    This tool is designed to run on Polaris-vended credentials only (see
+    catalog_properties() below); if vending ever silently fails to return
+    credentials for some reason, pyarrow's S3FileSystem falls back to its
+    own default AWS credential discovery (env vars, shared config, instance
+    role) rather than raising a clear error. Clearing these means that
+    failure mode surfaces as a loud, immediate auth error instead of quietly
+    reading (or writing) through whatever ambient AWS identity happens to be
+    sitting in the environment the script runs in.
+    """
+    return [var for var in _AMBIENT_AWS_VARS if os.environ.pop(var, None) is not None]
+
+
+# Purge at import, not just in main(). examples/aws-lambda/lambda_function.py
+# imports this module and calls run() directly without ever going through
+# main(), and the Lambda runtime injects the execution role's credentials
+# into the environment -- so import time is the only point that covers that
+# entry path. main() purges a second time, after .env is read; see there.
+purge_ambient_aws_credentials()
 
 # The consolidated table's own bookkeeping column (config: source_id_column)
 # is deliberately assigned a field id from this permanently out-of-band
@@ -1141,6 +1160,22 @@ def main():
     args = parser.parse_args()
 
     load_dotenv()  # loads .env into the process environment if present
+
+    # .env is read here, long after the import-time purge above, so a .env
+    # that sets AWS credentials would reintroduce exactly what that purge
+    # exists to prevent (python-dotenv won't overwrite a variable that is
+    # already set, but the purge just removed them, so it does set them).
+    # Purge again, and say so out loud rather than ignoring them silently --
+    # a .env with AWS keys in it means someone expected them to be used.
+    if reintroduced := purge_ambient_aws_credentials():
+        logger.warning(
+            "Ignoring AWS credential variables found in .env: %s. This tool runs on "
+            "Polaris-vended credentials only and never uses static AWS keys -- see "
+            ".env.example. (The AWS Glue example is the exception, and reads its own "
+            "examples/aws-glue/.env.)",
+            ", ".join(reintroduced),
+        )
+
     cfg = load_config(args.config)
     summary = run(cfg, tables=args.tables or None)
 
