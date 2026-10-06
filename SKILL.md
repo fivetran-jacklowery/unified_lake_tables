@@ -129,12 +129,15 @@ You need, from whoever you're helping:
 
 1. A Fivetran destination running on **Managed Data Lake Service** (not a
    warehouse destination) with a Polaris catalog behind it.
-2. Polaris OAuth client-credentials for that catalog: the catalog URI, token
-   URI, client ID, client secret, scope, and warehouse name. These come from
-   the Fivetran dashboard's destination/catalog settings, not from the
+2. Polaris OAuth client-credentials for that catalog: the catalog URI,
+   warehouse name, client ID, and client secret. All four are on the data
+   lake destination's details page in the Fivetran dashboard, not from the
    underlying cloud provider — this tool never needs raw AWS/GCS/Azure keys,
    it uses Polaris's vended-credentials support instead (see
    `docs/HOW_IT_WORKS.md` and the README's credentials section if asked why).
+   The warehouse name is the destination's group id, a generated two-word id
+   such as `easier_undertaken`. No token URI is needed — it's derived from
+   the catalog URI.
 3. The list of source **namespaces** (the Polaris/Iceberg namespaces the
    relevant Fivetran connections land into) that should be folded together —
    these must share the same table names and a structurally compatible

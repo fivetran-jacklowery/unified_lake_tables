@@ -85,12 +85,11 @@ mechanism.
 - A Fivetran destination on **Managed Data Lake Service (MDLS)**, backed by
   Fivetran's **Polaris** Iceberg REST catalog.
 - OAuth **client-credentials** for that catalog integration: a catalog URI,
-  a token endpoint, a client id/secret pair, a scope, and a warehouse name.
-  Find these in the Fivetran dashboard on your MDLS destination's setup
-  page (look for "catalog integration," "Polaris," or "Iceberg REST
-  catalog" -- exact labeling varies by dashboard version). If you can't
-  find them, ask your Fivetran account team for the Polaris catalog
-  connection details for that destination.
+  a warehouse name, and a client id/secret pair. All four are on your data
+  lake destination's details page in the Fivetran dashboard. The warehouse
+  name is the destination's group id (a generated two-word id such as
+  `easier_undertaken`), which doubles as the Polaris catalog name. You do
+  not need a token endpoint -- the scripts derive it from the catalog URI.
 - Two or more source namespaces sharing the same table names and a
   structurally compatible schema (same connector, different tenants/
   accounts/databases is the common case). List them explicitly, or give a

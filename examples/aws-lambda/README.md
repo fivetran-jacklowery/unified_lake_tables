@@ -175,7 +175,7 @@ aws lambda create-function \
   --memory-size 512 \
   --environment "Variables={
     POLARIS_CATALOG_URI=https://random-words.us-east-1.aws.polaris.fivetran.com/api/catalog,
-    POLARIS_WAREHOUSE=your_warehouse,
+    POLARIS_WAREHOUSE=easier_undertaken,
     POLARIS_CLIENT_ID=your_client_id,
     POLARIS_CLIENT_SECRET=your_client_secret,
     TARGET_NAMESPACE=consolidated,
@@ -192,7 +192,7 @@ Environment variables this function reads (see `lambda_function.py`'s
 | Variable | Required | Notes |
 |---|---|---|
 | `POLARIS_CATALOG_URI` | yes | Same as `.env`'s `POLARIS_CATALOG_URI` in the CLI setup. Copy it from your data lake destination's details page. |
-| `POLARIS_WAREHOUSE` | yes | |
+| `POLARIS_WAREHOUSE` | yes | The destination's group id (a two-word id like `easier_undertaken`), which is also the Polaris catalog name. |
 | `POLARIS_CLIENT_ID` | yes | |
 | `POLARIS_CLIENT_SECRET` | yes | See "Beyond this example" below before using this in anything but a first test. |
 | `POLARIS_TOKEN_URI` | no | Derived as `<POLARIS_CATALOG_URI>/v1/oauth/tokens`. Set it only to override that. |
