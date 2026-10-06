@@ -174,7 +174,7 @@ aws lambda create-function \
   --timeout 300 \
   --memory-size 512 \
   --environment "Variables={
-    POLARIS_CATALOG_URI=https://abc123xyz7890-acc.us-east-1.aws.polaris.fivetran.com/api/catalog,
+    POLARIS_CATALOG_URI=https://random-words.us-east-1.aws.polaris.fivetran.com/api/catalog,
     POLARIS_WAREHOUSE=your_warehouse,
     POLARIS_CLIENT_ID=your_client_id,
     POLARIS_CLIENT_SECRET=your_client_secret,
@@ -191,7 +191,7 @@ Environment variables this function reads (see `lambda_function.py`'s
 
 | Variable | Required | Notes |
 |---|---|---|
-| `POLARIS_CATALOG_URI` | yes | Same as `.env`'s `POLARIS_CATALOG_URI` in the CLI setup. Account- and region-specific; copy it from the dashboard. |
+| `POLARIS_CATALOG_URI` | yes | Same as `.env`'s `POLARIS_CATALOG_URI` in the CLI setup. Copy it from your data lake destination's details page. |
 | `POLARIS_WAREHOUSE` | yes | |
 | `POLARIS_CLIENT_ID` | yes | |
 | `POLARIS_CLIENT_SECRET` | yes | See "Beyond this example" below before using this in anything but a first test. |
