@@ -194,7 +194,7 @@ Environment variables this function reads (see `lambda_function.py`'s
 | `POLARIS_CATALOG_URI` | yes | Same as `.env`'s `POLARIS_CATALOG_URI` in the CLI setup. Copy it from your data lake destination's details page. |
 | `POLARIS_WAREHOUSE` | yes | The destination's group id (a two-word id like `easier_undertaken`), which is also the Polaris catalog name. |
 | `POLARIS_CLIENT_ID` | yes | |
-| `POLARIS_CLIENT_SECRET` | yes | See "Beyond this example" below before using this in anything but a first test. |
+| `POLARIS_CLIENT_SECRET` | yes | Must be from the **"Write Credentials"** pair, not the read-only catalog integration tab. See "Beyond this example" below before using this in anything but a first test. |
 | `POLARIS_TOKEN_URI` | no | Derived as `<POLARIS_CATALOG_URI>/v1/oauth/tokens`. Set it only to override that. |
 | `TARGET_NAMESPACE` | yes | |
 | `SOURCE_NAMESPACES` | yes, unless using the pattern below | Comma-separated (this is the one shape difference from `config.yaml`'s YAML list). Fine for a handful of sources. |

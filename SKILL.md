@@ -138,6 +138,16 @@ You need, from whoever you're helping:
    The warehouse name is the destination's group id, a generated two-word id
    such as `easier_undertaken`. No token URI is needed — it's derived from
    the catalog URI.
+
+   **Ask for the "Write Credentials" pair by name.** Fivetran exposes two
+   credential pairs per MDLS destination: the *catalog integration* tab's
+   are read-only, and "Write Credentials" are the ones this tool needs,
+   because it creates a namespace and registers tables. Issuing them
+   requires **destination admin** on that MDLS destination — if the person
+   you're helping can't find the option, they need someone who administers
+   that destination. Don't let a read-only pair through: it won't fail at
+   connection time, it fails partway in, once registration first tries to
+   write.
 3. The list of source **namespaces** (the Polaris/Iceberg namespaces the
    relevant Fivetran connections land into) that should be folded together —
    these must share the same table names and a structurally compatible

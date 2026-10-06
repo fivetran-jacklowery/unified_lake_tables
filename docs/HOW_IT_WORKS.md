@@ -435,7 +435,16 @@ of this same check.
 `register_consolidation.py` never asks for or constructs an AWS access
 key/secret. `catalog_properties()` builds only Polaris OAuth
 client-credentials properties (`uri`, `warehouse`, `credential`, `scope`,
-optionally `oauth2-server-uri`) for pyiceberg's `RestCatalog`.
+`oauth2-server-uri`) for pyiceberg's `RestCatalog`.
+
+Those OAuth credentials must be the **write-capable** pair. Fivetran
+exposes two per MDLS destination: the *catalog integration* tab's are
+read-only, while **"Write Credentials"** — issuing them requires
+destination admin — are what this tool needs, since it creates a namespace
+and registers tables. The distinction is invisible until it bites: a
+read-only pair authenticates and lists tables perfectly well, so
+`verify_consolidation.py` succeeds and `register_consolidation.py` fails at
+its first write.
 
 Confirmed by reading pyiceberg 0.11.1's own source
 (`pyiceberg/catalog/rest/__init__.py`): `RestCatalog` sends the

@@ -90,6 +90,13 @@ mechanism.
   name is the destination's group id (a generated two-word id such as
   `easier_undertaken`), which doubles as the Polaris catalog name. You do
   not need a token endpoint -- the scripts derive it from the catalog URI.
+- **The write-capable credential pair specifically.** Fivetran offers two
+  for an MDLS destination: the ones on the *catalog integration* tab are
+  read-only, and **"Write Credentials"** are the ones this tool needs, since
+  it creates a namespace and registers tables. Issuing them requires
+  **destination admin** on that MDLS destination. Read-only credentials
+  don't fail cleanly -- `verify_consolidation.py` runs fine and
+  `register_consolidation.py` fails on its first write.
 - Two or more source namespaces sharing the same table names and a
   structurally compatible schema (same connector, different tenants/
   accounts/databases is the common case). List them explicitly, or give a
