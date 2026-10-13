@@ -68,8 +68,9 @@ from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.expressions import AlwaysTrue
 from pyiceberg.io.pyarrow import ArrowScan
+from pyiceberg.exceptions import ResolveError
 from pyiceberg.manifest import DataFile, DataFileContent
-from pyiceberg.schema import Schema
+from pyiceberg.schema import Schema, promote
 from pyiceberg.typedef import Record
 from pyiceberg.types import StringType
 
@@ -712,6 +713,89 @@ def find_field_id_disagreements(schemas_by_source: dict) -> list:
     return disagreements
 
 
+def promote_target_types_to_widest(cat, target_table, target_id, schemas_by_source):
+    """Widen the TARGET's column types to the widest type any source uses.
+
+    Returns the (possibly reloaded) target table.
+
+    Why this has to happen before anything is spliced. The target's schema is
+    seeded from source_namespaces[0] alone, so it inherits THAT source's
+    types. If another source holds a wider type for the same column -- `long`
+    where the baseline has `int`, `double` where it has `float` -- nothing
+    currently notices: file_has_drift_beyond() compares a field id's NAME
+    against the target's, never its TYPE, so the wider source's files sail
+    through the no-rewrite splice path. The run reports success with zero
+    collisions.
+
+    The resulting table is then unreadable. Reproduced with a two-source
+    probe (int baseline, long second source): 12 rows spliced, 0 rewritten,
+    run reports success, and the first read of the target dies with
+
+        pyiceberg.exceptions.ResolveError: Cannot promote long to int
+
+    because the physical file holds 8-byte values and the schema promises 4.
+    That is the same class of failure as the customer's Snowflake "6 bytes in
+    BOOLEAN" error -- a manifest describing bytes that aren't what it says.
+
+    Promotion is the cheap repair, not rewriting. Iceberg can read a narrow
+    file through a wider schema (int file, long column -> promoted on read),
+    so widening the TARGET makes every source's existing files valid where
+    they are. Nothing is rewritten and no field id moves -- verified:
+    union_by_name/update_column promote int->long in place with ids intact.
+
+    Deliberately NOT a blanket union_by_name(src_schema) over every source,
+    which would also be correct but would quietly cost a great deal. That
+    adds absent columns at FRESH ids (100001+), whereas register_table()'s
+    widen step adds them at the source's OWN physical id via the
+    _last_column_id trick, which is exactly what lets that source's files be
+    spliced instead of rewritten. Promote types here; leave new columns to
+    the widen path.
+
+    Incompatible types -- string vs long, say -- are a hard stop. No single
+    Iceberg column can hold both, so there is no consolidation to do and
+    proceeding would mean choosing whose data to corrupt.
+    """
+    target_fields = {f.name: f for f in target_table.schema().fields}
+    widest: dict = {}
+    for ns, schema in schemas_by_source.items():
+        for f in schema.fields:
+            tf = target_fields.get(f.name)
+            if tf is None:
+                continue  # a new column -- the widen path handles it, at its own id
+            current = widest.get(f.name, tf.field_type)
+            if current == f.field_type:
+                continue
+            try:
+                promote(current, f.field_type)  # current -> source's: source is wider
+            except ResolveError:
+                try:
+                    promote(f.field_type, current)  # source -> current: keep current
+                    continue
+                except ResolveError:
+                    raise SystemExit(
+                        f"[{target_id}] sources disagree irreconcilably on the type of "
+                        f"column '{f.name}': {current} vs {f.field_type} (from {ns}). "
+                        "No single Iceberg column can hold both, so these sources cannot "
+                        "be consolidated into one table on this column. Fix the type at "
+                        "the source, or exclude that source."
+                    )
+            widest[f.name] = f.field_type
+
+    if not widest:
+        return target_table
+
+    for col, new_type in sorted(widest.items()):
+        logger.info(
+            "  [%s] widening target type: '%s' %s -> %s (a source holds the wider type)",
+            target_id, col, target_fields[col].field_type, new_type,
+        )
+    with target_table.transaction() as txn:
+        with txn.update_schema() as us:
+            for col, new_type in widest.items():
+                us.update_column(col, field_type=new_type)
+    return cat.load_table(target_id)
+
+
 def register_table(table_name: str, cfg: dict) -> tuple:
     """Runs inside the table-level thread pool (or serially if called
     directly) -- one call registers one target table end to end, using its
@@ -833,6 +917,17 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         actual_id = target_table.schema().find_field(source_id_column).field_id
         logger.info("  [%s] created target table, %s field_id=%d", table_name, source_id_column, actual_id)
         assert actual_id == RESERVED_FIELD_ID_BASE
+
+    # Widen the target's column types to the widest any source uses, BEFORE
+    # a single file is spliced. The target inherits source_namespaces[0]'s
+    # types, and drift detection only ever compares NAMES -- so without this,
+    # a source holding a wider type for a column the baseline also has gets
+    # spliced in silently and the target becomes unreadable. See
+    # promote_target_types_to_widest(). Runs on every pass, not just at
+    # creation: a source can widen a column at any time.
+    target_table = promote_target_types_to_widest(
+        cat, target_table, target_id, {ns: schema for ns, (schema, _) in files_by_source.items()}
+    )
 
     # The reference frame for "has any source drifted?" MUST be the target's
     # OWN current schema, not source_namespaces[0]'s -- see
@@ -1182,10 +1277,35 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         # flagging this source's file at all on the next run, since the
         # field id was already "known" -- reproduced live, see
         # CHANGELOG.md "Fixed: silent field-id collision misattribution".
+        # union_by_name(), not add_column(name, ftype). The append below
+        # carries this source's ENTIRE column set, not just the one drifted
+        # column -- so every column the source has and the target lacks must
+        # be registered first, or pyiceberg rejects the whole append with
+        #     ValueError: PyArrow table contains more columns: <col>.
+        #     Update the schema first (hint, use union_by_name).
+        # and the run dies with nothing committed for this table.
+        #
+        # add_column() covered only the single colliding column, which is a
+        # subset of what is needed and happens to be sufficient ONLY when the
+        # sources' column sets are identical. They are not, in general:
+        # discover_common_tables() intersects table NAMES, never column
+        # names, so a tenant whose connector is newer or whose source gained
+        # a column legitimately carries columns the baseline source lacks.
+        # Reproduced with a three-source probe where one source had one extra
+        # column: hard crash on the first run.
+        #
+        # This cannot be left to the splice path's widen step either. That
+        # fires on ids flagged by file_has_drift_beyond(), which returns the
+        # FIRST mismatching id per file and stops -- for a source whose base
+        # schema already diverges, that is the divergent id, so an extra
+        # column sitting at some later id is never even looked at.
+        #
+        # union_by_name adds exactly the missing fields by name, leaves
+        # existing ones alone, and never renumbers -- so it subsumes the
+        # add_column case and fixes the general one.
         with target_table.transaction() as txn:
-            if not column_already_exists:
-                with txn.update_schema() as us:
-                    us.add_column(name, ftype)
+            with txn.update_schema() as us:
+                us.union_by_name(src_schema)
             for tab in tabs:
                 txn.append(tab)
         target_table = cat.load_table(target_id)

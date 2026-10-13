@@ -93,6 +93,59 @@ tables. The two carried-over assumptions in
 `examples/aws-glue/README.md` -- the reserved-field-id trick and whether
 Glue's `CreateTable` renumbers field ids -- remain open.
 
+### Fixed: two more correctness gaps, found by probing for them deliberately
+
+Phase 1 of the agreed plan is "make it account for everything, even if that
+means a lot of rewriting." Two gaps beyond the NULL bug below, both found by
+writing probes for the cases nobody had tried rather than by waiting for a
+report. Both produce a **broken run that reports success**.
+
+**1. A source carrying a column the baseline lacks crashed the whole run.**
+The rewrite appends a source's ENTIRE column set, but only registered the one
+colliding column (`add_column(name, ftype)`). Any other column the target did
+not already have aborted the append:
+
+```
+ValueError: PyArrow table contains more columns: extra.
+Update the schema first (hint, use union_by_name).
+```
+
+Nothing committed for that table. Not exotic either: `discover_common_tables()`
+intersects table NAMES, never column names, so a tenant whose connector is
+newer legitimately carries extra columns. The splice path's widen step cannot
+cover it, because `file_has_drift_beyond()` returns the FIRST mismatching id
+and stops -- for an already-divergent source that is the divergent id, so a
+later extra column is never examined. Now `union_by_name(src_schema)`, which
+registers every missing column by name, leaves existing ones alone, and never
+renumbers.
+
+**2. Type divergence was spliced silently and made the target unreadable.**
+Drift detection compares a field id's NAME against the target's, never its
+TYPE. The target inherits `source_namespaces[0]`'s types -- so a source
+holding `long` where the baseline holds `int` sailed through the no-rewrite
+path. Two-source probe: **12 rows spliced, 0 rewritten, run reports success**,
+and the first read of the target dies with
+
+```
+pyiceberg.exceptions.ResolveError: Cannot promote long to int
+```
+
+because the file holds 8-byte values and the schema promises 4. Same class as
+the customer's Snowflake "6 bytes in BOOLEAN": a manifest describing bytes
+that are not what it says.
+
+Fixed by `promote_target_types_to_widest()`, which widens the TARGET to the
+widest type any source uses before anything is spliced. **This costs zero
+rewrites** -- Iceberg reads a narrow file through a wider schema, so widening
+the target makes every source's existing files valid where they are, with no
+field id moving. Deliberately not a blanket `union_by_name` over every source,
+which would also be correct but would add absent columns at fresh ids
+(100001+) instead of at the source's own physical id, forfeiting the splice
+for exactly the sources the widen path exists to keep cheap.
+
+Irreconcilable types (`string` vs `int`) now abort with an actionable message
+instead of silently picking one and corrupting the other source.
+
 ### Fixed: the collision-rewrite path dropped NULL rows and duplicated on reruns
 
 Predicted by reading the code while fixing the Glue fork, then **reproduced
