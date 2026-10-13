@@ -1,31 +1,57 @@
 # AWS Glue Data Catalog variant
 
-A direct adaptation of `register_consolidation.py` (the Fivetran-managed
-Polaris/MDLS original in this repo's `scripts/` directory) for a
-customer-managed **AWS Glue Data Catalog** instead of a Fivetran-managed
-Polaris catalog. If your Iceberg tables' catalog is Glue -- a common setup
-when you're running your own AWS Glue / Athena / EMR / S3 Iceberg stack --
-this is the file to start from.
+Runs the same consolidation against a customer-managed **AWS Glue Data
+Catalog** instead of a Fivetran-managed Polaris catalog. If your Iceberg
+tables' catalog is Glue -- a common setup when you're running your own AWS
+Glue / Athena / EMR / S3 Iceberg stack -- start here.
 
-## What actually changed
+## How this works now (changed — read this if you used the old version)
 
-Exactly one thing: how the catalog connection is constructed
-(`catalog_properties()` and `_make_catalog()` in `register_consolidation_glue.py`).
-Everything else -- the reserve/splice/detect-collisions/rewrite/retire-orphaned-files
-mechanism, `register_table()`, `file_has_drift_beyond()`,
-`already_registered_by_source()` -- is copied verbatim from the validated
-Polaris version. That logic operates entirely on pyiceberg
-Table/Schema/Transaction objects once a table is loaded, which is
-catalog-agnostic: `GlueCatalog` and `RestCatalog` both implement the same
-abstract pyiceberg `Catalog` interface (confirmed directly against the
-installed pyiceberg 0.11.1 library, not assumed from documentation).
+Glue is a **backend switch inside the one validated implementation**, not a
+separate script:
+
+```
+CATALOG_BACKEND=glue   ->  scripts/register_consolidation.py talks to GlueCatalog
+CATALOG_BACKEND=polaris ->  (default) same file talks to Polaris via RestCatalog
+```
+
+`register_consolidation_glue.py` in this directory is now a ~90-line adapter
+that sets that variable and calls the main script. It contains no
+consolidation logic of its own.
+
+**This used to be a full fork** — an 839-line copy of the main script with
+only the catalog construction changed. Its header promised everything else
+was "copied verbatim, unmodified, from the validated Polaris version." That
+was true the day it was written and false within weeks: the main script went
+on to receive a series of field-id correctness fixes, and the fork received
+none of them, because a copy doesn't announce that its original has moved.
+
+A customer ran that fork against a six-tenant SQL Server replication in Glue,
+where the same column carries a different Iceberg field id in each tenant's
+table. The fork spliced files by reference whose embedded field ids
+disagreed with the target's schema, producing a consolidated table that
+returned the **wrong column's values** — and reported success with zero
+rewrites. The fixes that prevent exactly this had been in the main script for
+some time. See the repo root `CHANGELOG.md`.
+
+If you have a local copy of the old `register_consolidation_glue.py`, replace
+it. You can check what you have in one command:
+
+```bash
+grep -c 'src_field.name != target_name' register_consolidation_glue.py
+```
+
+Anything other than `0` on the *new* adapter means you're looking at the old
+fork (the new adapter holds no such logic — the main script does).
 
 ## The one real difference: credentials
 
 Polaris **vends** short-lived, per-table-scoped AWS storage credentials
-automatically on every table load. AWS Glue Data Catalog has no equivalent
-mechanism. The IAM principal (role, user, or instance profile) running this
-script needs its own **standing** AWS credentials with:
+automatically on every table load, and the Polaris path deliberately strips
+ambient AWS credentials from the environment to force that vended-only path.
+Glue has no equivalent mechanism and vends nothing. The IAM principal (role,
+user, or instance profile) running this needs its own **standing** AWS
+credentials with:
 
 - **Glue permissions** across every source database this tool reads
   (`glue:GetDatabase`, `glue:GetTable`, `glue:GetTables`,
@@ -35,26 +61,41 @@ script needs its own **standing** AWS credentials with:
   the target table's data location (read + write).
 
 Because there's no per-table credential vending under Glue, this is
-necessarily a **broader IAM footprint** than the Polaris version needs.
-Size the IAM policy accordingly, and consider scoping by S3 prefix or
-bucket policy if your sources span more locations than you want one role
-to reach. This is a real trade-off, not a footnote -- worth discussing
-with whoever owns IAM policy on your side before running this broadly.
+necessarily a **broader IAM footprint** than the Polaris path needs. Size the
+IAM policy accordingly, and consider scoping by S3 prefix or bucket policy if
+your sources span more locations than you want one role to reach. This is a
+real trade-off, not a footnote -- worth discussing with whoever owns IAM
+policy on your side before running this broadly.
 
-## What's proven versus what's adapted-but-unverified
+### Why the adapter sets `CATALOG_BACKEND` in code
+
+The main module decides **at import time** whether to purge ambient AWS
+credentials, and on Glue those credentials are the only ones there are.
+Setting `CATALOG_BACKEND` in `.env` is too late — `load_dotenv()` doesn't run
+until `main()`. That single ordering constraint is the entire reason this
+wrapper exists instead of a README line telling you to export a variable.
+The main script detects the too-late case and fails with an explicit message
+rather than letting it surface as an opaque S3/Glue auth error.
+
+Either of these works:
+
+```bash
+python examples/aws-glue/register_consolidation_glue.py     # adapter sets it for you
+export CATALOG_BACKEND=glue && python scripts/register_consolidation.py
+```
+
+## What's proven versus what's still unverified on Glue
 
 The core mechanism was validated against a live Fivetran-managed Polaris
-catalog -- see the repo root's `CHANGELOG.md` and `docs/HOW_IT_WORKS.md`
-for exactly what was tested, including real reproductions of the
-copy-on-write duplication bug and its fix, and the full history of what
-schema-drift scenarios have and haven't been exercised.
+catalog -- see the repo root's `CHANGELOG.md` and `docs/HOW_IT_WORKS.md` for
+exactly what was tested, including real reproductions of the copy-on-write
+duplication bug and its fix, and the full history of which schema-drift
+scenarios have and haven't been exercised. Collapsing the fork means Glue now
+inherits all of that, and every future fix, automatically.
 
-**The catalog swap in this example has not yet been run against a live AWS
-Glue Data Catalog with real source tables.** It's a direct, mechanical
-adaptation based on pyiceberg's shared `Catalog` interface, not something
-independently re-tested end to end the way the Polaris version was before
-this repo's 1.0.0 release. Two specific things flagged in the code
-comments as carried-over assumptions rather than re-confirmed facts:
+**What that does not do is make Glue itself tested.** The backend swap has
+still not been run end to end against a live AWS Glue Data Catalog with real
+source tables. Two specific carried-over assumptions remain unconfirmed:
 
 1. The reserved-field-id trick in `create_target_table()` (an
    `itertools.count` assigned to a private pyiceberg `UpdateSchema`
@@ -65,9 +106,39 @@ comments as carried-over assumptions rather than re-confirmed facts:
    the same way Polaris's REST catalog does (the reason the two-step
    create-then-widen dance exists at all) hasn't been separately verified.
 
-Treat this as a starting point to validate in a sandbox/dev Glue catalog
-first, the same way the Polaris original was validated before being
-trusted against anything real.
+Validate in a sandbox/dev Glue catalog first, the same way the Polaris
+original was validated before being trusted against anything real.
+
+## Before you run this against many tenants
+
+If your sources are per-tenant replicas of one logical schema, check whether
+they actually agree on field ids **before** consolidating anything. Tables
+that land the same column on different field ids are correct but expensive
+here: each divergent source gets 0 files spliced and 100% of its rows
+physically rewritten, which forfeits the no-rewrite premise that is the point
+of this tool.
+
+The run tells you up front — `find_field_id_disagreements()` is a pre-flight
+that executes before any target table is created, and prints a per-source
+table of how many files will be rewritten. Read that output before letting a
+large first run proceed. See the repo root `CHANGELOG.md` for the measured
+difference between base-schema divergence (~100% of files, loud warning) and
+ordinary drift (recent files only, quiet INFO).
+
+### Known issue on that rewrite path — read before relying on the result
+
+There is an **open, unverified** finding that the rewrite path may drop rows
+and double-count them on reruns: rows where the drifted column is NULL look
+like they never land, and the idempotency guard looks like it never trips
+when nulls are present, re-appending on every run. It is a code reading, not
+yet reproduced — full detail in the repo root `CHANGELOG.md`.
+
+It matters here because base-schema field-id divergence is exactly what puts
+a source on that path, and it is the common case for per-tenant replicas.
+
+Always run `scripts/verify_consolidation.py` after a consolidation that
+reported any rewrites. Its per-source row-count check is what would catch
+this, and a mismatch there means do not trust the target table.
 
 ## Setup
 
@@ -78,16 +149,19 @@ cp config.example.yaml config.yaml   # list your source databases
 python register_consolidation_glue.py
 ```
 
-If you're running this somewhere that already has an IAM role attached
-(EC2, ECS, Lambda, CodeBuild, etc. -- recommended), you can leave every
-`AWS_*` variable in `.env` blank; boto3's default credential chain picks up
-the attached role automatically. `GLUE_WAREHOUSE_PATH` is the one value
-you always need to set.
+If you're running this somewhere that already has an IAM role attached (EC2,
+ECS, Lambda, CodeBuild, etc. -- recommended), you can leave every `AWS_*`
+variable in `.env` blank; boto3's default credential chain picks up the
+attached role automatically. `GLUE_WAREHOUSE_PATH` is the one value you
+always need to set.
+
+Scheduling this on Lambda works too — see `examples/aws-lambda/`, which sets
+`CATALOG_BACKEND` as an ordinary Lambda environment variable.
 
 ## Everything else
 
 Config shape, the known limitations (renamed/dropped columns, changed data
 types, and which rename scenario is fixed versus which one silently goes
-stale), and the overall "what this does NOT yet handle" list are identical
-to the Polaris original -- see the repo root `README.md`. None of that is
+stale), and the overall "what this does NOT yet handle" list are identical to
+the Polaris original -- see the repo root `README.md`. None of that is
 catalog-specific.

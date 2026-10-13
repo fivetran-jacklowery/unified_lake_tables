@@ -31,6 +31,18 @@ and Polaris vends short-lived, scoped AWS storage credentials per table load
 (see docs/HOW_IT_WORKS.md's "Credentials: vended, not static" section). The
 execution role attached to this function only needs enough to run and write
 its own CloudWatch Logs (AWSLambdaBasicExecutionRole is sufficient).
+
+THAT LAST PARAGRAPH IS POLARIS-ONLY. This handler also works against a
+customer-managed AWS Glue Data Catalog -- set CATALOG_BACKEND=glue plus
+GLUE_WAREHOUSE_PATH as ordinary Lambda environment variables (Lambda sets
+those before the process starts, which is early enough; see the import-time
+note in register_consolidation.py). But on Glue there is no credential
+vending, so the inverse of the above is true: the execution role becomes the
+ONLY credential, and it needs Glue read across every source database plus
+create/alter on the target, and S3 read across every source location plus
+read+write on the target's. Size that role deliberately --
+examples/aws-glue/README.md covers the full permission list and the
+trade-off.
 """
 import json
 import logging
@@ -131,7 +143,8 @@ def handler(event, context):
     # rc.run() -> resolve_source_namespaces(), which logs the resolved list
     # itself) -- log whichever one is actually configured here.
     logger.info(
-        "Starting registration run: target=%s sources=%s tables=%s",
+        "Starting registration run: backend=%s target=%s sources=%s tables=%s",
+        rc.catalog_backend(),
         cfg["target_namespace"],
         cfg.get("source_namespaces") or f"pattern:{cfg.get('source_namespace_pattern')!r}",
         tables or "auto-discover",

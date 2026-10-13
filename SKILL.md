@@ -91,9 +91,12 @@ never perform it.
 
 This invariant currently holds by construction: across
 `register_consolidation.py`, `verify_consolidation.py`, `bench_vs_union.py`
-and the Glue example, every mutating call's receiver is `target_table` (or a
-transaction on it), and source handles only ever receive `.scan()`,
-`.schema()` and `.io`. **If you change this code, preserve that property** —
+and `generate_delta_log.py`, every mutating call's receiver is `target_table`
+(or a transaction on it), and source handles only ever receive `.scan()`,
+`.schema()` and `.io`. The `examples/` entry points are thin adapters that
+hold no consolidation logic of their own, so re-checking the four scripts
+above covers every backend. **If you change this code, preserve that
+property** —
 it is the safety guarantee, and it is worth re-checking with a quick grep
 for write calls whose receiver is not the target before you finish.
 

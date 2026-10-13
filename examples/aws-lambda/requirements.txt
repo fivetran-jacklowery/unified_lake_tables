@@ -5,3 +5,24 @@ pyiceberg[pyarrow]==0.11.1
 pyarrow==25.0.0
 PyYAML==6.0.3
 python-dotenv==1.0.1
+
+# ---------------------------------------------------------------------------
+# Only if you set CATALOG_BACKEND=glue on this function.
+# ---------------------------------------------------------------------------
+#
+# The Glue backend needs boto3 at runtime. pyiceberg.catalog.glue imports
+# boto3 directly; its mypy_boto3_glue imports are TYPE_CHECKING-only and are
+# NOT needed at runtime (verified against the installed library), so the
+# pyiceberg[glue] extra is not required here.
+#
+# Lambda's managed Python runtime already bundles boto3, so leaving this
+# commented out does work. But that boto3 version floats with the runtime,
+# which is exactly what every other pin in this file exists to avoid -- and
+# a runtime-initiated boto3 bump would arrive with no warning. If you are
+# running the Glue backend on Lambda for anything you care about, uncomment
+# this to pin it explicitly, matching examples/aws-glue/requirements.txt.
+#
+# Adds roughly 15MB unzipped; check the build.sh output against Lambda's
+# 250MB unzipped ceiling after uncommenting.
+#
+# boto3==1.43.66

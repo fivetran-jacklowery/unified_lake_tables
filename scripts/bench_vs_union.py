@@ -51,12 +51,11 @@ from dotenv import load_dotenv
 # namespace resolution here, or this can silently drift from what the
 # registration script actually does.
 from register_consolidation import (
-    catalog_properties,
+    get_catalog,
     discover_common_tables,
     load_config,
     resolve_source_namespaces,
 )
-from pyiceberg.catalog.rest import RestCatalog
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -241,7 +240,9 @@ def main():
 
     load_dotenv()
     cfg = load_config(args.config)
-    cat = RestCatalog("fivetran_mdls_bench", **catalog_properties())
+    # Backend-aware (CATALOG_BACKEND): never rebuild a catalog locally --
+    # see verify_consolidation.py's note and CHANGELOG.md.
+    cat = get_catalog()
     sources = resolve_source_namespaces(cat, cfg)
 
     table = args.table

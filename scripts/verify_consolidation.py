@@ -49,12 +49,13 @@ from dotenv import load_dotenv
 # sync with how the registration script actually authenticates or resolves
 # source tables.
 from register_consolidation import (
-    catalog_properties,
+    catalog_backend,
     discover_common_tables,
+    get_catalog,
     load_config,
     resolve_source_namespaces,
 )
-from pyiceberg.catalog.rest import RestCatalog
+from pyiceberg.catalog import Catalog  # noqa: F401  (re-exported for callers' type hints)
 
 from multi_source_io import MultiSourceFileIO
 
@@ -64,9 +65,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("verify_consolidation")
 
-
-def get_catalog() -> RestCatalog:
-    return RestCatalog("fivetran_mdls_verify", **catalog_properties())
+# get_catalog is imported from register_consolidation rather than rebuilt
+# here. It used to be a local two-line copy that hard-coded
+# RestCatalog(**catalog_properties()) -- which meant that the moment the
+# registration script gained a Glue backend, this verifier would have gone
+# on building a Polaris catalog no matter what CATALOG_BACKEND said, and a
+# Glue user's verification run would have failed (or worse, silently checked
+# the wrong catalog). That is the same copy-drifts-from-original failure
+# that put a stale fork of the whole registration script in
+# examples/aws-glue/ and corrupted a customer's data; see CHANGELOG.md.
+# Don't reintroduce a local catalog constructor here.
 
 
 def verify_table(cat, table_name: str, source_namespaces: list, target_namespace: str, source_id_column: str) -> bool:
