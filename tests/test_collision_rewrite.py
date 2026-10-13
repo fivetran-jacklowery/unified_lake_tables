@@ -11,10 +11,9 @@ Needs `sqlalchemy` on top of requirements.txt (pyiceberg's SqlCatalog).
 
 WHY THESE EXIST
 ---------------
-A customer reported on 2026-10-13 that rows whose drifted column was NULL
-never reached the target: 80 rows missing across six tenants, exactly equal
-to the 80 NULLs in those tenants' drifted columns, while the run reported
-success. The three tenants with no NULLs lost nothing.
+Rows whose drifted column was NULL never reached the target: a source came
+up short by exactly the number of NULLs in its drifted column, while the run
+reported success. Sources with no NULLs lost nothing.
 
 The rewrite read the source with a `{name} is not null` row filter, and for
 base-schema divergence that append is the ONLY path those rows have into the
@@ -32,14 +31,15 @@ The NULLs must sit in the column the COLLISION NAMES for the losing source,
 not merely in some nullable column. A first draft of this test put them
 elsewhere and passed against the known-broken code.
 
-test_base_schema_divergence   -- every file drifts (the customer's shape)
+test_base_schema_divergence   -- every file drifts
 test_ordinary_drift           -- only SOME files drift
 
 The second one is not redundant. The obvious fix for the first -- drop the
 filter, read the whole source -- is correct when every file drifts and WRONG
 here, because step 3 splices the non-drifted files in by reference and
 re-reading the whole table appends those rows a second time. That trades row
-loss for row duplication, and Tamarac-shaped data would never reveal it.
+loss for row duplication, and data where every file drifts would never
+reveal it.
 """
 import os
 import shutil
@@ -87,8 +87,8 @@ def _counts(tgt, sources):
 def test_base_schema_divergence():
     """Same column, different field id per source, NULLs in the drifted one.
 
-    This is the customer's shape: identical names and types, divergent ids,
-    so 100% of the losing source's files take the rewrite path.
+    Identical names and types, divergent ids, so 100% of the losing source's
+    files take the rewrite path.
     """
     work = tempfile.mkdtemp(prefix="ult_base_")
     try:
@@ -213,7 +213,7 @@ def test_heterogeneous_sources():
       * a source MISSING a baseline column (must come back NULL, not shift).
       * manifest bound consistency, which is the Snowflake symptom. A file
         whose bounds describe a different column than the schema says is
-        exactly what produced the customer's "6 bytes in BOOLEAN" error, so
+        what makes a warehouse reject the table on read, so
         assert bound widths against the target's declared types directly.
     """
     work = tempfile.mkdtemp(prefix="ult_hetero_")

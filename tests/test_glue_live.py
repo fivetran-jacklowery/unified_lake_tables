@@ -23,11 +23,10 @@ unverified assumptions from the day the Glue path was written:
 Both now answered -- see CHANGELOG.md. Keep this runnable so they stay
 answered, because a pyiceberg or Glue upgrade can change either.
 
-Fivetran is not writing into the catalog this was developed against, so the
-sources here are built to mimic what it produces: per-tenant tables with
-identical column names and types but DIFFERENT field ids, and NULLs in the
-drifted column. Field-id layout is the thing under test, and that is pure
-metadata -- the data's provenance is irrelevant to it.
+The sources here are built to reproduce the shape that matters: several
+sources with identical column names and types but DIFFERENT field ids, and
+NULLs in the drifted column. Field-id layout is the thing under test, and
+that is pure metadata, so it does not matter who wrote the underlying data.
 
 Everything is created under a unique timestamped prefix and removed in a
 finally block, so a failure mid-run still cleans up. Requires Glue
@@ -69,30 +68,30 @@ glue = boto3.client("glue", region_name=REGION)
 N = 10
 SCHEMAS = {
     DB_A: Schema(  # baseline
-        NestedField(1, "accountid", StringType(), required=False),
-        NestedField(2, "custodiancash", LongType(), required=False),
-        NestedField(3, "excludeall", BooleanType(), required=False),
-        NestedField(4, "reconciliationstatus", StringType(), required=False),
+        NestedField(1, "rowkey", StringType(), required=False),
+        NestedField(2, "amount", LongType(), required=False),
+        NestedField(3, "flag", BooleanType(), required=False),
+        NestedField(4, "status", StringType(), required=False),
     ),
-    DB_B: Schema(  # same names and types, SHUFFLED ids -- the customer's shape
-        NestedField(1, "reconciliationstatus", StringType(), required=False),
-        NestedField(2, "excludeall", BooleanType(), required=False),
-        NestedField(3, "accountid", StringType(), required=False),
-        NestedField(4, "custodiancash", LongType(), required=False),
+    DB_B: Schema(  # same names and types, SHUFFLED ids
+        NestedField(1, "status", StringType(), required=False),
+        NestedField(2, "flag", BooleanType(), required=False),
+        NestedField(3, "rowkey", StringType(), required=False),
+        NestedField(4, "amount", LongType(), required=False),
     ),
 }
 DATA = {
-    DB_A: {"accountid": [f"a{i}" for i in range(N)],
-           "custodiancash": list(range(N)),
-           "excludeall": [i % 2 == 0 for i in range(N)],
-           "reconciliationstatus": [f"ra{i}" for i in range(N)]},
-    # NULLs in the drifted column -- the exact condition that lost 80 rows
-    DB_B: {"reconciliationstatus": [None if i % 3 == 0 else f"rb{i}" for i in range(N)],
-           "excludeall": [i % 3 == 0 for i in range(N)],
-           "accountid": [f"b{i}" for i in range(N)],
-           "custodiancash": [1000 + i for i in range(N)]},
+    DB_A: {"rowkey": [f"a{i}" for i in range(N)],
+           "amount": list(range(N)),
+           "flag": [i % 2 == 0 for i in range(N)],
+           "status": [f"ra{i}" for i in range(N)]},
+    # NULLs in the drifted column -- the condition that caused row loss
+    DB_B: {"status": [None if i % 3 == 0 else f"rb{i}" for i in range(N)],
+           "flag": [i % 3 == 0 for i in range(N)],
+           "rowkey": [f"b{i}" for i in range(N)],
+           "amount": [1000 + i for i in range(N)]},
 }
-EXPECTED_NULLS = sum(1 for v in DATA[DB_B]["reconciliationstatus"] if v is None)
+EXPECTED_NULLS = sum(1 for v in DATA[DB_B]["status"] if v is None)
 
 results = []
 
@@ -136,14 +135,14 @@ try:
     check("backend resolves to GlueCatalog", type(cat).__name__ == "GlueCatalog",
           type(cat).__name__)
 
-    print("\n=== create sources (mimicking Fivetran's metadata shape) ===")
+    print("\n=== create sources (divergent field ids) ===")
     for db, schema in SCHEMAS.items():
-        t = cat.create_table(f"{db}.account", schema=schema)
+        t = cat.create_table(f"{db}.widgets", schema=schema)
         cols = [f.name for f in schema.fields]
         t.append(pa.table({c: DATA[db][c] for c in cols}).cast(schema.as_arrow()))
-        print(f"  {db}: {({f.name: f.field_id for f in cat.load_table(f'{db}.account').schema().fields})}")
+        print(f"  {db}: {({f.name: f.field_id for f in cat.load_table(f'{db}.widgets').schema().fields})}")
 
-    got_ids = {f.name: f.field_id for f in cat.load_table(f"{DB_A}.account").schema().fields}
+    got_ids = {f.name: f.field_id for f in cat.load_table(f"{DB_A}.widgets").schema().fields}
     want_ids = {f.name: f.field_id for f in SCHEMAS[DB_A].fields}
     check("ASSUMPTION B: Glue CreateTable preserves field ids", got_ids == want_ids,
           f"asked {want_ids}, got {got_ids}")
@@ -152,12 +151,12 @@ try:
     cfg = {"source_namespaces": [DB_A, DB_B], "target_namespace": DB_T,
            "source_id_column": "source_connection_id",
            "table_workers": 1, "source_workers": 1}
-    r1 = rc.run(cfg, tables=["account"])
-    r2 = rc.run(cfg, tables=["account"])
+    r1 = rc.run(cfg, tables=["widgets"])
+    r2 = rc.run(cfg, tables=["widgets"])
     print(f"  run 1: spliced={r1['total_spliced']} rewritten={r1['total_rewritten']}")
     print(f"  run 2: spliced={r2['total_spliced']} rewritten={r2['total_rewritten']}")
 
-    tgt = cat.load_table(f"{DB_T}.account")
+    tgt = cat.load_table(f"{DB_T}.widgets")
     tgt_ids = {f.name: f.field_id for f in tgt.schema().fields}
     check("ASSUMPTION A: reserved field id 100000 holds on Glue",
           tgt_ids.get("source_connection_id") == rc.RESERVED_FIELD_ID_BASE,
@@ -170,8 +169,8 @@ try:
 
     check("no row loss", got.num_rows == 2 * N, f"{got.num_rows} != {2 * N}")
     check("no rerun duplication", r2["total_spliced"] == 0 and r2["total_rewritten"] == 0)
-    check("NULLs preserved", got.column("reconciliationstatus").null_count == EXPECTED_NULLS,
-          f"{got.column('reconciliationstatus').null_count} != {EXPECTED_NULLS}")
+    check("NULLs preserved", got.column("status").null_count == EXPECTED_NULLS,
+          f"{got.column('status').null_count} != {EXPECTED_NULLS}")
 
     crossover = []
     for db in (DB_A, DB_B):
@@ -198,7 +197,7 @@ try:
     import verify_consolidation as vc
 
     check("verify_consolidation passes",
-          vc.verify_table(cat, "account", [DB_A, DB_B], DB_T, "source_connection_id"))
+          vc.verify_table(cat, "widgets", [DB_A, DB_B], DB_T, "source_connection_id"))
 
 except Exception:  # noqa: BLE001
     traceback.print_exc()

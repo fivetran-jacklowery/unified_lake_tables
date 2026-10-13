@@ -27,19 +27,13 @@ with pyiceberg and reads them with pyiceberg will always agree with itself.
      data files spliced and its deletes dropped, so rows deleted at the
      source come back to life in the target.
 
-     For Fivetran sources this is established, and -- usefully -- it does
-     NOT depend on which catalog you use. `CatalogWriter` is an interface
-     whose whole surface is catalog-pointer management (registerTable /
-     updateTableMetadata with a metadata location); GlueCatalogWriter never
-     touches a data file or manifest, and ManagedDataLakeWriter owns a
-     CatalogWriter rather than the reverse. The same writer produces the
-     files whether you register them in Polaris, Glue, Unity or several at
-     once, and it has zero merge-on-read call sites and six copy-on-write
-     ones. See docs/HOW_IT_WORKS.md.
+     For Fivetran-managed sources this is expected to hold, and it does not
+     depend on which catalog the tables are registered in -- registering a
+     table in a catalog only records where its metadata lives; it does not
+     change how the data was written. See docs/HOW_IT_WORKS.md.
 
-     The check stays anyway: it costs nothing, it covers sources this tool
-     was never aimed at, and it would catch that guarantee changing
-     upstream.
+     The check runs anyway: it costs nothing, it covers sources this tool
+     was never aimed at, and it would catch that expectation changing.
 
   3. FIELD-ID AGREEMENT ACROSS SOURCES. Where sources disagree, each
      divergent source is rewritten in full rather than spliced -- correct,

@@ -26,12 +26,11 @@ was true the day it was written and false within weeks: the main script went
 on to receive a series of field-id correctness fixes, and the fork received
 none of them, because a copy doesn't announce that its original has moved.
 
-A customer ran that fork against a six-tenant SQL Server replication in Glue,
-where the same column carries a different Iceberg field id in each tenant's
-table. The fork spliced files by reference whose embedded field ids
-disagreed with the target's schema, producing a consolidated table that
-returned the **wrong column's values** — and reported success with zero
-rewrites. The fixes that prevent exactly this had been in the main script for
+That fork was then run against a multi-source deployment in Glue where the
+same column carries a different Iceberg field id in each source. It spliced
+files by reference whose embedded field ids disagreed with the target's
+schema, producing a consolidated table that returned the **wrong column's
+values** — and reported success with zero rewrites. The fixes that prevent exactly this had been in the main script for
 some time. See the repo root `CHANGELOG.md`.
 
 If you have a local copy of the old `register_consolidation_glue.py`, replace
@@ -93,7 +92,7 @@ automatically.
 
 **The Glue path itself has now also been run end to end against a real AWS
 Glue Data Catalog + S3**, which it had not been before. `tests/test_glue_live.py`
-creates per-tenant Iceberg tables with divergent field ids, consolidates
+creates Iceberg tables with divergent field ids, consolidates
 them, and checks the result — 9/9 passing. The two assumptions this section
 used to carry as unverified are now findings:
 
@@ -145,15 +144,14 @@ ordinary drift (recent files only, quiet INFO).
 ### Fixed in this version: NULL rows were dropped on the rewrite path
 
 If you ran an **earlier** build, consolidated tables produced by it may be
-missing rows. A customer hit this on 2026-10-13: rows whose drifted column
-was NULL never reached the target (80 missing across six tenants, exactly
-matching the 80 NULLs), and reruns duplicated the rows that did land. Both
-are fixed, with regression tests at `tests/test_collision_rewrite.py`. Full
-detail in the repo root `CHANGELOG.md`.
+missing rows. Rows whose drifted column was NULL never reached the target --
+a source came up short by exactly the number of NULLs in that column -- and
+reruns duplicated the rows that did land. Both are fixed, with regression
+tests at `tests/test_collision_rewrite.py`. Full detail in the repo root
+`CHANGELOG.md`.
 
-It bit on Glue specifically because base-schema field-id divergence is what
-routes a source onto the rewrite path, and that is the normal case for
-per-tenant replicas.
+It shows up wherever base-schema field-id divergence routes a source onto
+the rewrite path, which is the normal case for per-tenant replicas.
 
 **If you consolidated with an earlier build, re-verify.** The target is not
 self-healing for the duplicate half — rerunning an affected table against an

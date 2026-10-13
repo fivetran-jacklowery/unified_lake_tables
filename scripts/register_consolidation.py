@@ -107,9 +107,8 @@ def catalog_backend() -> str:
     this file received the field-id correctness fixes (e1650c1's
     name-comparison in file_has_drift_beyond(), find_field_id_disagreements(),
     the one-scan rewrite, spliced_by_source orphan filtering, the atomic
-    schema+data commit) and the fork received none of them. A customer ran
-    the fork against a 6-tenant Glue catalog and got exactly the silent
-    cross-tenant field-id corruption those fixes exist to prevent. See
+    schema+data commit) and the fork received none of them. The fork was run against a multi-source Glue catalog and hit exactly the silent
+    cross-source field-id corruption those fixes exist to prevent. See
     CHANGELOG.md.
 
     So: one implementation, one switch. A backend must never again be a copy
@@ -588,7 +587,7 @@ def already_registered_by_source(target_table) -> dict:
          rerun came back with every source's row count exactly doubled).
       2. NEW: orphan detection. Fivetran's Managed Data Lake writer is
          copy-on-write for UPDATE and DELETE (confirmed by reading
-         ManagedDataLakeWriter.java: upsert()/update()/delete() all rewrite
+         the upstream writer is copy-on-write: update and delete rewrite
          whichever existing physical file(s) could contain the affected
          primary key(s) into brand-new file(s), then atomically swap old for
          new via Iceberg's OverwriteFiles -- deleteFile() + addFile() in one
@@ -656,9 +655,8 @@ def find_field_id_disagreements(schemas_by_source: dict) -> list:
     """Find field ids that DIFFERENT SOURCES already disagree about.
 
     This guards a failure mode the collision logic structurally cannot see,
-    and which silently corrupts data. Reported by a customer 2026-09-22 and
-    reproduced with two sources whose columns differ only in declaration
-    order (see CHANGELOG.md).
+    and which silently corrupts data. Reproduced with two sources whose
+    columns differ only in declaration order (see CHANGELOG.md).
 
     The collision path in register_table() only ever fires on *drift* --
     file_has_drift_beyond() flags a field id the TARGET does not already
@@ -670,8 +668,8 @@ def find_field_id_disagreements(schemas_by_source: dict) -> list:
     files spliced in by reference.
 
     Iceberg then resolves columns by field id, so that source's files get
-    read through the first source's names and types. The customer saw
-    metrics land in the wrong columns and a DOUBLE truncated to a LONG.
+    read through the first source's names and types: values land in the
+    wrong columns, and a DOUBLE can be truncated to a LONG.
 
     This is not exotic. Fivetran assigns field ids in column-declaration
     order, so two tenants whose tables were created with the same columns in
@@ -734,8 +732,8 @@ def promote_target_types_to_widest(cat, target_table, target_id, schemas_by_sour
         pyiceberg.exceptions.ResolveError: Cannot promote long to int
 
     because the physical file holds 8-byte values and the schema promises 4.
-    That is the same class of failure as the customer's Snowflake "6 bytes in
-    BOOLEAN" error -- a manifest describing bytes that aren't what it says.
+    That is the same class of failure as a warehouse rejecting a bound whose
+    width does not match the declared type -- a manifest describing bytes that aren't what it says.
 
     Promotion is the cheap repair, not rewriting. Iceberg can read a narrow
     file through a wider schema (int file, long column -> promoted on read),
@@ -877,8 +875,8 @@ def register_table(table_name: str, cfg: dict) -> tuple:
             "",
             "This is NOT the drift collision this tool resolves as routine: that is",
             "a NEW column landing on an occupied id. Here the sources' BASE schemas",
-            "disagree -- typically because Fivetran assigns field ids in column",
-            "declaration order, and these tables were created with their columns in",
+            "disagree -- typically because field ids are assigned in column order at",
+            "table creation, and these tables were created with their columns in",
             "different orders.",
             "",
         ]
@@ -1174,9 +1172,8 @@ def register_table(table_name: str, cfg: dict) -> tuple:
             # -- a non-null row count on the left, a total row count on the
             # right. Any NULL at all in the drifted column made the left side
             # permanently smaller, so the guard never fired and every rerun
-            # re-appended. Reproduced by a customer on 2026-10-13 against six
-            # tenants: 80 rows short, exactly matching the 80 NULLs, with the
-            # three null-free sources losing nothing. See CHANGELOG.md.
+            # re-appended. Reproduced against multi-source data. See
+            # CHANGELOG.md.
             #
             # Both sides are now total row counts for this source, taken from
             # MANIFEST METADATA rather than by scanning data. That is exact,
@@ -1229,9 +1226,9 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         # the source's files are ALL excluded from splicing above, so this
         # append is the ONLY path those rows have into the target -- and any
         # row whose drifted column was NULL was filtered right back out of
-        # it. Customer-reproduced 2026-10-13: 80 rows short across six
-        # tenants, exactly equal to the 80 NULLs, with the three null-free
-        # sources losing nothing. See CHANGELOG.md.
+        # it. Reproduced against multi-source data: rows short by exactly the
+        # number of NULLs, with null-free sources losing nothing. See
+        # CHANGELOG.md.
         #
         # The fix is NOT simply dropping the filter. A whole-table scan would
         # be correct for base-schema divergence (where every file is drifted)
@@ -1239,8 +1236,7 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         # column: step 3 splices this source's non-drifted files in by
         # reference, so re-reading the whole table here would append those
         # rows a second time. That trades a row-loss bug for a row-duplication
-        # bug -- and Tamarac-shaped data, where every file drifts, would not
-        # have shown it.
+        # bug -- and data where every file drifts would not have shown it.
         #
         # So scan the drifted files and nothing else. ArrowScan takes the
         # FileScanTasks directly, which is also why to_rewrite_tasks is kept

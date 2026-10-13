@@ -22,12 +22,12 @@ spliced_by_source orphan filter, the atomic schema+data commit -- and this
 fork received none of them. Nothing flagged the drift, because a copy
 doesn't announce that its original moved.
 
-A customer then ran this fork against a six-tenant SQL Server replication
-in Glue, where the same column carries a different Iceberg field id per
-tenant. It spliced files by reference whose embedded field ids disagreed
-with the target schema, producing a consolidated table that returned the
-wrong column's values -- the precise corruption those fixes exist to
-prevent -- and reported success with 0 rewrites. See CHANGELOG.md.
+The fork was then run against a multi-source deployment in Glue where the
+same column carries a different Iceberg field id in each source. It spliced
+files by reference whose embedded field ids disagreed with the target
+schema, producing a consolidated table that returned the wrong column's
+values -- the precise corruption those fixes exist to prevent -- and
+reported success with 0 rewrites. See CHANGELOG.md.
 
 So the fork is gone. The backend is now a switch (CATALOG_BACKEND) inside
 the one validated implementation, and every current and future fix reaches
