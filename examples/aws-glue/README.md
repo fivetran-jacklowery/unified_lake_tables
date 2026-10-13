@@ -84,30 +84,47 @@ python examples/aws-glue/register_consolidation_glue.py     # adapter sets it fo
 export CATALOG_BACKEND=glue && python scripts/register_consolidation.py
 ```
 
-## What's proven versus what's still unverified on Glue
+## What's proven on Glue
 
 The core mechanism was validated against a live Fivetran-managed Polaris
-catalog -- see the repo root's `CHANGELOG.md` and `docs/HOW_IT_WORKS.md` for
-exactly what was tested, including real reproductions of the copy-on-write
-duplication bug and its fix, and the full history of which schema-drift
-scenarios have and haven't been exercised. Collapsing the fork means Glue now
-inherits all of that, and every future fix, automatically.
+catalog -- see the repo root's `CHANGELOG.md` and `docs/HOW_IT_WORKS.md`.
+Collapsing the fork means Glue inherits all of that, and every future fix,
+automatically.
 
-**What that does not do is make Glue itself tested.** The backend swap has
-still not been run end to end against a live AWS Glue Data Catalog with real
-source tables. Two specific carried-over assumptions remain unconfirmed:
+**The Glue path itself has now also been run end to end against a real AWS
+Glue Data Catalog + S3**, which it had not been before. `tests/test_glue_live.py`
+creates per-tenant Iceberg tables with divergent field ids, consolidates
+them, and checks the result — 9/9 passing. The two assumptions this section
+used to carry as unverified are now findings:
 
-1. The reserved-field-id trick in `create_target_table()` (an
-   `itertools.count` assigned to a private pyiceberg `UpdateSchema`
-   attribute) is pyiceberg-library-internal and *should* behave identically
-   regardless of catalog backend -- but that's an expectation carried over
-   from Polaris testing, not independently confirmed against Glue.
-2. Whether Glue's own `CreateTable` handling renumbers field ids on create
-   the same way Polaris's REST catalog does (the reason the two-step
-   create-then-widen dance exists at all) hasn't been separately verified.
+1. **The reserved-field-id trick holds on Glue.** `create_target_table()`
+   forces `source_connection_id` to field id 100000 by assigning an
+   `itertools.count` to a private pyiceberg `UpdateSchema` attribute. On a
+   live Glue catalog it lands at exactly 100000.
+2. **Glue's `CreateTable` does not renumber field ids.** Asked for ids 1-4,
+   got ids 1-4. The two-step create-then-widen dance is still correct, and
+   nothing Glue-specific is needed around it.
 
-Validate in a sandbox/dev Glue catalog first, the same way the Polaris
-original was validated before being trusted against anything real.
+Also confirmed live on Glue, not just against the local SQLite catalog the
+rest of `tests/` uses: no row loss, no rerun duplication, NULLs preserved,
+no field-id crossover, manifest bounds matching declared types (the Snowflake
+symptom), and a clean `verify_consolidation.py`.
+
+That test is opt-in, because it creates real AWS resources:
+
+```bash
+ULT_LIVE_GLUE=1 python tests/test_glue_live.py
+```
+
+It needs Glue create/delete on its own timestamped databases and S3
+create/delete on its own bucket, and removes everything in a `finally` block.
+Re-run it after any pyiceberg upgrade — both findings above depend on library
+internals that could change without a deprecation warning.
+
+**Still unexercised:** decimal precision/scale divergence across sources.
+pyiceberg has a known decimal-promotion bug (see `CHANGELOG.md`), and real
+per-tenant replicas often differ here, so validate that case against your own
+data before trusting a large run.
 
 ## Before you run this against many tenants
 

@@ -93,6 +93,43 @@ tables. The two carried-over assumptions in
 `examples/aws-glue/README.md` -- the reserved-field-id trick and whether
 Glue's `CreateTable` renumbers field ids -- remain open.
 
+### Verified on a real AWS Glue Data Catalog -- both carried-over assumptions confirmed
+
+The Glue path had never been run against a live Glue catalog; everything was
+either inherited from Polaris testing or verified against a local SQLite
+catalog. `tests/test_glue_live.py` now closes that, and the two assumptions
+`examples/aws-glue/README.md` has carried since the Glue path was written are
+findings rather than expectations:
+
+1. **The reserved-field-id trick holds on Glue.** `create_target_table()`
+   forces `source_connection_id` to field id 100000 by assigning an
+   `itertools.count` to a *private* pyiceberg `UpdateSchema` attribute. On a
+   live Glue catalog it lands at exactly 100000.
+2. **Glue's `CreateTable` does not renumber field ids.** Asked for 1-4, got
+   1-4. The two-step create-then-widen dance stays correct and needs nothing
+   Glue-specific.
+
+Also confirmed live on Glue rather than only locally: no row loss, no rerun
+duplication, NULLs preserved, no field-id crossover, manifest bounds matching
+declared types (the Snowflake symptom), and a clean `verify_consolidation.py`
+-- 9/9.
+
+Sources are created by the test to mimic Fivetran's metadata shape
+(per-tenant tables, identical names and types, divergent field ids, NULLs in
+the drifted column), because the catalog this was developed against is not
+fed by Fivetran. Field-id layout is pure metadata, so provenance does not
+affect what is under test.
+
+Opt-in, since it creates real AWS resources and costs real (trivial) money:
+
+```bash
+ULT_LIVE_GLUE=1 python tests/test_glue_live.py
+```
+
+Timestamped databases and bucket, removed in a `finally` block. Worth
+re-running after any pyiceberg upgrade -- both findings depend on library
+internals that can change with no deprecation warning.
+
 ### Fixed: two more correctness gaps, found by probing for them deliberately
 
 Phase 1 of the agreed plan is "make it account for everything, even if that
