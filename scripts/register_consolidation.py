@@ -66,12 +66,14 @@ import yaml
 from dotenv import load_dotenv
 from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.rest import RestCatalog
+from pyiceberg.expressions import AlwaysTrue
+from pyiceberg.io.pyarrow import ArrowScan
+from pyiceberg.exceptions import ResolveError
 from pyiceberg.manifest import DataFile, DataFileContent
-from pyiceberg.schema import Schema
+from pyiceberg.schema import Schema, promote
 from pyiceberg.typedef import Record
 from pyiceberg.types import StringType
 
-from multi_source_io import MultiSourceFileIO
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -105,9 +107,8 @@ def catalog_backend() -> str:
     this file received the field-id correctness fixes (e1650c1's
     name-comparison in file_has_drift_beyond(), find_field_id_disagreements(),
     the one-scan rewrite, spliced_by_source orphan filtering, the atomic
-    schema+data commit) and the fork received none of them. A customer ran
-    the fork against a 6-tenant Glue catalog and got exactly the silent
-    cross-tenant field-id corruption those fixes exist to prevent. See
+    schema+data commit) and the fork received none of them. The fork was run against a multi-source Glue catalog and hit exactly the silent
+    cross-source field-id corruption those fixes exist to prevent. See
     CHANGELOG.md.
 
     So: one implementation, one switch. A backend must never again be a copy
@@ -586,7 +587,7 @@ def already_registered_by_source(target_table) -> dict:
          rerun came back with every source's row count exactly doubled).
       2. NEW: orphan detection. Fivetran's Managed Data Lake writer is
          copy-on-write for UPDATE and DELETE (confirmed by reading
-         ManagedDataLakeWriter.java: upsert()/update()/delete() all rewrite
+         the upstream writer is copy-on-write: update and delete rewrite
          whichever existing physical file(s) could contain the affected
          primary key(s) into brand-new file(s), then atomically swap old for
          new via Iceberg's OverwriteFiles -- deleteFile() + addFile() in one
@@ -654,9 +655,8 @@ def find_field_id_disagreements(schemas_by_source: dict) -> list:
     """Find field ids that DIFFERENT SOURCES already disagree about.
 
     This guards a failure mode the collision logic structurally cannot see,
-    and which silently corrupts data. Reported by a customer 2026-09-22 and
-    reproduced with two sources whose columns differ only in declaration
-    order (see CHANGELOG.md).
+    and which silently corrupts data. Reproduced with two sources whose
+    columns differ only in declaration order (see CHANGELOG.md).
 
     The collision path in register_table() only ever fires on *drift* --
     file_has_drift_beyond() flags a field id the TARGET does not already
@@ -668,8 +668,8 @@ def find_field_id_disagreements(schemas_by_source: dict) -> list:
     files spliced in by reference.
 
     Iceberg then resolves columns by field id, so that source's files get
-    read through the first source's names and types. The customer saw
-    metrics land in the wrong columns and a DOUBLE truncated to a LONG.
+    read through the first source's names and types: values land in the
+    wrong columns, and a DOUBLE can be truncated to a LONG.
 
     This is not exotic. Fivetran assigns field ids in column-declaration
     order, so two tenants whose tables were created with the same columns in
@@ -709,6 +709,89 @@ def find_field_id_disagreements(schemas_by_source: dict) -> list:
         if len(distinct) > 1:
             disagreements.append((field_id, entries))
     return disagreements
+
+
+def promote_target_types_to_widest(cat, target_table, target_id, schemas_by_source):
+    """Widen the TARGET's column types to the widest type any source uses.
+
+    Returns the (possibly reloaded) target table.
+
+    Why this has to happen before anything is spliced. The target's schema is
+    seeded from source_namespaces[0] alone, so it inherits THAT source's
+    types. If another source holds a wider type for the same column -- `long`
+    where the baseline has `int`, `double` where it has `float` -- nothing
+    currently notices: file_has_drift_beyond() compares a field id's NAME
+    against the target's, never its TYPE, so the wider source's files sail
+    through the no-rewrite splice path. The run reports success with zero
+    collisions.
+
+    The resulting table is then unreadable. Reproduced with a two-source
+    probe (int baseline, long second source): 12 rows spliced, 0 rewritten,
+    run reports success, and the first read of the target dies with
+
+        pyiceberg.exceptions.ResolveError: Cannot promote long to int
+
+    because the physical file holds 8-byte values and the schema promises 4.
+    That is the same class of failure as a warehouse rejecting a bound whose
+    width does not match the declared type -- a manifest describing bytes that aren't what it says.
+
+    Promotion is the cheap repair, not rewriting. Iceberg can read a narrow
+    file through a wider schema (int file, long column -> promoted on read),
+    so widening the TARGET makes every source's existing files valid where
+    they are. Nothing is rewritten and no field id moves -- verified:
+    union_by_name/update_column promote int->long in place with ids intact.
+
+    Deliberately NOT a blanket union_by_name(src_schema) over every source,
+    which would also be correct but would quietly cost a great deal. That
+    adds absent columns at FRESH ids (100001+), whereas register_table()'s
+    widen step adds them at the source's OWN physical id via the
+    _last_column_id trick, which is exactly what lets that source's files be
+    spliced instead of rewritten. Promote types here; leave new columns to
+    the widen path.
+
+    Incompatible types -- string vs long, say -- are a hard stop. No single
+    Iceberg column can hold both, so there is no consolidation to do and
+    proceeding would mean choosing whose data to corrupt.
+    """
+    target_fields = {f.name: f for f in target_table.schema().fields}
+    widest: dict = {}
+    for ns, schema in schemas_by_source.items():
+        for f in schema.fields:
+            tf = target_fields.get(f.name)
+            if tf is None:
+                continue  # a new column -- the widen path handles it, at its own id
+            current = widest.get(f.name, tf.field_type)
+            if current == f.field_type:
+                continue
+            try:
+                promote(current, f.field_type)  # current -> source's: source is wider
+            except ResolveError:
+                try:
+                    promote(f.field_type, current)  # source -> current: keep current
+                    continue
+                except ResolveError:
+                    raise SystemExit(
+                        f"[{target_id}] sources disagree irreconcilably on the type of "
+                        f"column '{f.name}': {current} vs {f.field_type} (from {ns}). "
+                        "No single Iceberg column can hold both, so these sources cannot "
+                        "be consolidated into one table on this column. Fix the type at "
+                        "the source, or exclude that source."
+                    )
+            widest[f.name] = f.field_type
+
+    if not widest:
+        return target_table
+
+    for col, new_type in sorted(widest.items()):
+        logger.info(
+            "  [%s] widening target type: '%s' %s -> %s (a source holds the wider type)",
+            target_id, col, target_fields[col].field_type, new_type,
+        )
+    with target_table.transaction() as txn:
+        with txn.update_schema() as us:
+            for col, new_type in widest.items():
+                us.update_column(col, field_type=new_type)
+    return cat.load_table(target_id)
 
 
 def register_table(table_name: str, cfg: dict) -> tuple:
@@ -792,8 +875,8 @@ def register_table(table_name: str, cfg: dict) -> tuple:
             "",
             "This is NOT the drift collision this tool resolves as routine: that is",
             "a NEW column landing on an occupied id. Here the sources' BASE schemas",
-            "disagree -- typically because Fivetran assigns field ids in column",
-            "declaration order, and these tables were created with their columns in",
+            "disagree -- typically because field ids are assigned in column order at",
+            "table creation, and these tables were created with their columns in",
             "different orders.",
             "",
         ]
@@ -832,6 +915,17 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         actual_id = target_table.schema().find_field(source_id_column).field_id
         logger.info("  [%s] created target table, %s field_id=%d", table_name, source_id_column, actual_id)
         assert actual_id == RESERVED_FIELD_ID_BASE
+
+    # Widen the target's column types to the widest any source uses, BEFORE
+    # a single file is spliced. The target inherits source_namespaces[0]'s
+    # types, and drift detection only ever compares NAMES -- so without this,
+    # a source holding a wider type for a column the baseline also has gets
+    # spliced in silently and the target becomes unreadable. See
+    # promote_target_types_to_widest(). Runs on every pass, not just at
+    # creation: a source can widen a column at any time.
+    target_table = promote_target_types_to_widest(
+        cat, target_table, target_id, {ns: schema for ns, (schema, _) in files_by_source.items()}
+    )
 
     # The reference frame for "has any source drifted?" MUST be the target's
     # OWN current schema, not source_namespaces[0]'s -- see
@@ -1038,14 +1132,22 @@ def register_table(table_name: str, cfg: dict) -> tuple:
     #    pipeline, and only for the small sliver of genuinely-colliding new
     #    data, never the historical bulk.
     rewritten_rows = 0
+    # Recomputed AFTER step 3's commit, so it reflects what is actually in the
+    # target right now. The guard below counts rows from this rather than
+    # scanning data, which is both exact and free -- see there.
+    already_by_source_now, _ = already_registered_by_source(target_table)
     for ns, field_id, name, ftype in rewrite_needed:
         src_schema, files = files_by_source[ns]
-        to_rewrite = [
-            task.file
+        # Keep the TASKS, not just the DataFiles. The rewrite below reads
+        # exactly these files through ArrowScan, and that needs FileScanTask
+        # objects. to_rewrite is derived from them for the row-count math.
+        to_rewrite_tasks = [
+            task
             for task in files
             if task.file.file_path not in already
             and file_has_drift_beyond(task.file, known_field_names, src_schema) == field_id
         ]
+        to_rewrite = [task.file for task in to_rewrite_tasks]
         if not to_rewrite:
             continue
 
@@ -1053,54 +1155,39 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         column_already_exists = name in {f.name for f in target_table.schema().fields}
 
         if column_already_exists:
-            # The column is already registered. With the atomic fix below,
+            # The column is already registered. With the atomic commit below,
             # that alone would normally be enough to know its data is there
-            # too -- but a run from BEFORE this fix could have left the
+            # too -- but a run from BEFORE that fix could have left the
             # column registered with none of this source's data ever
             # appended (see CHANGELOG.md "Fixed: silent field-id collision
             # misattribution" and file_has_drift_beyond()'s docstring for
-            # the full mechanism). Check row content explicitly rather than
-            # trusting "column exists" alone, so a pre-existing broken state
-            # gets healed instead of silently staying broken.
+            # the full mechanism). Check explicitly rather than trusting
+            # "column exists" alone, so a pre-existing broken state gets
+            # healed instead of silently staying broken.
             #
-            # This scan's row_filter restricts to source_id_column = ns, but
-            # the matching files (spliced in by reference in a prior run,
-            # per this tool's whole no-rewrite design) still physically
-            # live under NS's OWN storage location, not the target's -- and
-            # Polaris only ever vends the target table's credential scoped
-            # to the target's own location. Reading through target_table.io
-            # alone hits AWS ACCESS_DENIED here (reproduced live, see
-            # CHANGELOG.md's "Known issue: collision-rewrite path can hit
-            # ACCESS_DENIED under vended credentials"). Temporarily swap in
-            # a FileIO that also tries this source's own vended credential
-            # -- src_table.io -- before falling back to failure; restore
-            # the target's own IO immediately after.
-            # source_id_column MUST stay in selected_fields even though only
-            # `name` is counted. The target is identity-partitioned on
-            # source_id_column, and pyiceberg's _get_column_projection_values
-            # resolves the partition source field against the PROJECTED
-            # schema, not the table schema:
-            #     partition_schema = partition_spec.partition_type(projected_schema)
-            # That line is reached whenever the projection contains a field id
-            # the physical file lacks -- which is always true here, because a
-            # collision gives `name` a fresh out-of-band field id that no
-            # spliced source file physically carries. Projecting `name` alone
-            # therefore crashes with "ValueError: Could not find field with
-            # id: <reserved id>" (reproduced live 2026-09-10 on a real
-            # two-source collision). Keeping source_id_column in the
-            # projection puts the partition source field in the projected
-            # schema, so it resolves and the identity value backfills.
-            original_io = target_table.io
-            target_table.io = MultiSourceFileIO([target_table.io, src_table.io])
-            try:
-                already_rewritten = target_table.scan(
-                    row_filter=f"{source_id_column} = '{ns}' and {name} is not null",
-                    selected_fields=(name, source_id_column),
-                ).to_arrow().num_rows
-            finally:
-                target_table.io = original_io
-            expected_rows = sum(f.record_count for f in to_rewrite)
-            if already_rewritten >= expected_rows:
+            # COUNT LIKE WITH LIKE. This guard used to compare
+            #     target rows WHERE source = ns AND <name> IS NOT NULL
+            # against
+            #     sum(record_count) over the drifted files   (ALL rows)
+            # -- a non-null row count on the left, a total row count on the
+            # right. Any NULL at all in the drifted column made the left side
+            # permanently smaller, so the guard never fired and every rerun
+            # re-appended. Reproduced against multi-source data. See
+            # CHANGELOG.md.
+            #
+            # Both sides are now total row counts for this source, taken from
+            # MANIFEST METADATA rather than by scanning data. That is exact,
+            # free, and it also retires the MultiSourceFileIO/ACCESS_DENIED
+            # dance this block used to need: counting rows meant reading
+            # spliced files that physically live under the SOURCE's storage
+            # location, which the target's vended credential cannot reach.
+            # Summing record_count never opens a data file at all.
+            target_rows_for_ns = sum(
+                df.record_count for df in already_by_source_now.get(ns, {}).values()
+            )
+            source_rows_for_ns = sum(task.file.record_count for task in files)
+            already_rewritten, expected_rows = target_rows_for_ns, source_rows_for_ns
+            if target_rows_for_ns >= source_rows_for_ns:
                 logger.info(
                     "  [%s] '%s' from %s: %d row(s) already rewritten/appended in a prior run, skipping",
                     table_name,
@@ -1132,21 +1219,45 @@ def register_table(table_name: str, cfg: dict) -> tuple:
                 expected_rows,
             )
 
-        # ONE scan, not one per file in to_rewrite. This used to be a
-        # `for f in to_rewrite:` loop whose body never referenced `f` -- it
-        # re-ran the identical whole-table scan on every iteration and
-        # appended every copy, so a source with N drifted files had its
-        # drifted rows landed N times over. Reproduced live against a
-        # purpose-built two-source collision (see CHANGELOG.md):
-        # 7 drifted files produced 175,000 rows where 25,000 were correct,
-        # an exact 7x. See CHANGELOG.md "Fixed: collision rewrite appended
-        # one duplicate copy per drifted file".
+        # Read EXACTLY the drifted files, every row, NULLs preserved.
         #
-        # A single scan is already complete: `name is not null` selects every
-        # drifted row across all of this source's files at once, which is
-        # exactly what the rewrite needs. to_rewrite is still what decides
-        # WHETHER there is anything to rewrite, and how many rows to expect.
-        tab = src_table.scan(row_filter=f"{name} is not null").to_arrow()
+        # This used to be `src_table.scan(row_filter=f"{name} is not null")`,
+        # and that filter silently dropped rows. For base-schema divergence
+        # the source's files are ALL excluded from splicing above, so this
+        # append is the ONLY path those rows have into the target -- and any
+        # row whose drifted column was NULL was filtered right back out of
+        # it. Reproduced against multi-source data: rows short by exactly the
+        # number of NULLs, with null-free sources losing nothing. See
+        # CHANGELOG.md.
+        #
+        # The fix is NOT simply dropping the filter. A whole-table scan would
+        # be correct for base-schema divergence (where every file is drifted)
+        # but WRONG for ordinary drift, where only recent files carry the new
+        # column: step 3 splices this source's non-drifted files in by
+        # reference, so re-reading the whole table here would append those
+        # rows a second time. That trades a row-loss bug for a row-duplication
+        # bug -- and data where every file drifts would not have shown it.
+        #
+        # So scan the drifted files and nothing else. ArrowScan takes the
+        # FileScanTasks directly, which is also why to_rewrite_tasks is kept
+        # above. Going through ArrowScan rather than reading the Parquet with
+        # pyarrow directly matters: it applies the source's Iceberg schema, so
+        # a file written before some column existed still yields that column
+        # as NULL instead of coming back missing.
+        #
+        # Still ONE scan, not one per file -- this was previously a
+        # `for f in to_rewrite:` loop whose body never referenced `f`, which
+        # re-ran the identical whole-table scan per iteration and appended
+        # every copy (7 drifted files produced an exact 7x row count; see
+        # CHANGELOG.md "Fixed: collision rewrite appended one duplicate copy
+        # per drifted file"). Passing every task to a single to_table() call
+        # keeps that property structurally.
+        tab = ArrowScan(
+            src_table.metadata,
+            src_table.io,
+            src_schema,
+            AlwaysTrue(),
+        ).to_table(to_rewrite_tasks)
         if tab.num_rows == 0:
             continue
         tab = tab.append_column(source_id_column, pa.array([ns] * tab.num_rows, type=pa.string()))
@@ -1162,10 +1273,35 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         # flagging this source's file at all on the next run, since the
         # field id was already "known" -- reproduced live, see
         # CHANGELOG.md "Fixed: silent field-id collision misattribution".
+        # union_by_name(), not add_column(name, ftype). The append below
+        # carries this source's ENTIRE column set, not just the one drifted
+        # column -- so every column the source has and the target lacks must
+        # be registered first, or pyiceberg rejects the whole append with
+        #     ValueError: PyArrow table contains more columns: <col>.
+        #     Update the schema first (hint, use union_by_name).
+        # and the run dies with nothing committed for this table.
+        #
+        # add_column() covered only the single colliding column, which is a
+        # subset of what is needed and happens to be sufficient ONLY when the
+        # sources' column sets are identical. They are not, in general:
+        # discover_common_tables() intersects table NAMES, never column
+        # names, so a tenant whose connector is newer or whose source gained
+        # a column legitimately carries columns the baseline source lacks.
+        # Reproduced with a three-source probe where one source had one extra
+        # column: hard crash on the first run.
+        #
+        # This cannot be left to the splice path's widen step either. That
+        # fires on ids flagged by file_has_drift_beyond(), which returns the
+        # FIRST mismatching id per file and stops -- for a source whose base
+        # schema already diverges, that is the divergent id, so an extra
+        # column sitting at some later id is never even looked at.
+        #
+        # union_by_name adds exactly the missing fields by name, leaves
+        # existing ones alone, and never renumbers -- so it subsumes the
+        # add_column case and fixes the general one.
         with target_table.transaction() as txn:
-            if not column_already_exists:
-                with txn.update_schema() as us:
-                    us.add_column(name, ftype)
+            with txn.update_schema() as us:
+                us.union_by_name(src_schema)
             for tab in tabs:
                 txn.append(tab)
         target_table = cat.load_table(target_id)

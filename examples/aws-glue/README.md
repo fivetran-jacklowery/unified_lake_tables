@@ -26,12 +26,11 @@ was true the day it was written and false within weeks: the main script went
 on to receive a series of field-id correctness fixes, and the fork received
 none of them, because a copy doesn't announce that its original has moved.
 
-A customer ran that fork against a six-tenant SQL Server replication in Glue,
-where the same column carries a different Iceberg field id in each tenant's
-table. The fork spliced files by reference whose embedded field ids
-disagreed with the target's schema, producing a consolidated table that
-returned the **wrong column's values** — and reported success with zero
-rewrites. The fixes that prevent exactly this had been in the main script for
+That fork was then run against a multi-source deployment in Glue where the
+same column carries a different Iceberg field id in each source. It spliced
+files by reference whose embedded field ids disagreed with the target's
+schema, producing a consolidated table that returned the **wrong column's
+values** — and reported success with zero rewrites. The fixes that prevent exactly this had been in the main script for
 some time. See the repo root `CHANGELOG.md`.
 
 If you have a local copy of the old `register_consolidation_glue.py`, replace
@@ -84,30 +83,47 @@ python examples/aws-glue/register_consolidation_glue.py     # adapter sets it fo
 export CATALOG_BACKEND=glue && python scripts/register_consolidation.py
 ```
 
-## What's proven versus what's still unverified on Glue
+## What's proven on Glue
 
 The core mechanism was validated against a live Fivetran-managed Polaris
-catalog -- see the repo root's `CHANGELOG.md` and `docs/HOW_IT_WORKS.md` for
-exactly what was tested, including real reproductions of the copy-on-write
-duplication bug and its fix, and the full history of which schema-drift
-scenarios have and haven't been exercised. Collapsing the fork means Glue now
-inherits all of that, and every future fix, automatically.
+catalog -- see the repo root's `CHANGELOG.md` and `docs/HOW_IT_WORKS.md`.
+Collapsing the fork means Glue inherits all of that, and every future fix,
+automatically.
 
-**What that does not do is make Glue itself tested.** The backend swap has
-still not been run end to end against a live AWS Glue Data Catalog with real
-source tables. Two specific carried-over assumptions remain unconfirmed:
+**The Glue path itself has now also been run end to end against a real AWS
+Glue Data Catalog + S3**, which it had not been before. `tests/test_glue_live.py`
+creates Iceberg tables with divergent field ids, consolidates
+them, and checks the result — 9/9 passing. The two assumptions this section
+used to carry as unverified are now findings:
 
-1. The reserved-field-id trick in `create_target_table()` (an
-   `itertools.count` assigned to a private pyiceberg `UpdateSchema`
-   attribute) is pyiceberg-library-internal and *should* behave identically
-   regardless of catalog backend -- but that's an expectation carried over
-   from Polaris testing, not independently confirmed against Glue.
-2. Whether Glue's own `CreateTable` handling renumbers field ids on create
-   the same way Polaris's REST catalog does (the reason the two-step
-   create-then-widen dance exists at all) hasn't been separately verified.
+1. **The reserved-field-id trick holds on Glue.** `create_target_table()`
+   forces `source_connection_id` to field id 100000 by assigning an
+   `itertools.count` to a private pyiceberg `UpdateSchema` attribute. On a
+   live Glue catalog it lands at exactly 100000.
+2. **Glue's `CreateTable` does not renumber field ids.** Asked for ids 1-4,
+   got ids 1-4. The two-step create-then-widen dance is still correct, and
+   nothing Glue-specific is needed around it.
 
-Validate in a sandbox/dev Glue catalog first, the same way the Polaris
-original was validated before being trusted against anything real.
+Also confirmed live on Glue, not just against the local SQLite catalog the
+rest of `tests/` uses: no row loss, no rerun duplication, NULLs preserved,
+no field-id crossover, manifest bounds matching declared types (the Snowflake
+symptom), and a clean `verify_consolidation.py`.
+
+That test is opt-in, because it creates real AWS resources:
+
+```bash
+ULT_LIVE_GLUE=1 python tests/test_glue_live.py
+```
+
+It needs Glue create/delete on its own timestamped databases and S3
+create/delete on its own bucket, and removes everything in a `finally` block.
+Re-run it after any pyiceberg upgrade — both findings above depend on library
+internals that could change without a deprecation warning.
+
+**Still unexercised:** decimal precision/scale divergence across sources.
+pyiceberg has a known decimal-promotion bug (see `CHANGELOG.md`), and real
+per-tenant replicas often differ here, so validate that case against your own
+data before trusting a large run.
 
 ## Before you run this against many tenants
 
@@ -125,20 +141,26 @@ large first run proceed. See the repo root `CHANGELOG.md` for the measured
 difference between base-schema divergence (~100% of files, loud warning) and
 ordinary drift (recent files only, quiet INFO).
 
-### Known issue on that rewrite path — read before relying on the result
+### Fixed in this version: NULL rows were dropped on the rewrite path
 
-There is an **open, unverified** finding that the rewrite path may drop rows
-and double-count them on reruns: rows where the drifted column is NULL look
-like they never land, and the idempotency guard looks like it never trips
-when nulls are present, re-appending on every run. It is a code reading, not
-yet reproduced — full detail in the repo root `CHANGELOG.md`.
+If you ran an **earlier** build, consolidated tables produced by it may be
+missing rows. Rows whose drifted column was NULL never reached the target --
+a source came up short by exactly the number of NULLs in that column -- and
+reruns duplicated the rows that did land. Both are fixed, with regression
+tests at `tests/test_collision_rewrite.py`. Full detail in the repo root
+`CHANGELOG.md`.
 
-It matters here because base-schema field-id divergence is exactly what puts
-a source on that path, and it is the common case for per-tenant replicas.
+It shows up wherever base-schema field-id divergence routes a source onto
+the rewrite path, which is the normal case for per-tenant replicas.
 
-Always run `scripts/verify_consolidation.py` after a consolidation that
-reported any rewrites. Its per-source row-count check is what would catch
-this, and a mismatch there means do not trust the target table.
+**If you consolidated with an earlier build, re-verify.** The target is not
+self-healing for the duplicate half — rerunning an affected table against an
+existing target can leave the extra rows in place. Safest is to drop the
+affected target tables and re-register from scratch.
+
+Either way, always run `scripts/verify_consolidation.py` after a
+consolidation that reported any rewrites. Its per-source row-count check is
+what caught this, and a mismatch means do not trust the target table.
 
 ## Setup
 

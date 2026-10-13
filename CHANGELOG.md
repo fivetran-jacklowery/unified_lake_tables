@@ -93,12 +93,149 @@ tables. The two carried-over assumptions in
 `examples/aws-glue/README.md` -- the reserved-field-id trick and whether
 Glue's `CreateTable` renumbers field ids -- remain open.
 
-### Open, unverified: the rewrite path looks like it drops rows, and double-counts on reruns
+### Established: the Glue toggle changes the catalog, not the writer
 
-Found by reading the code while fixing the Glue fork, **not yet reproduced
-against live data.** Flagging it now because collapsing the fork routes Glue
-users onto this exact path, and the customer above would land on it
-immediately.
+A question worth recording because the intuition runs the wrong way. The
+lake this tool was developed against does not feed a Glue catalog; the
+reporting customer's does. That looks like a different destination and
+therefore a different code path, which would mean none of this tool's
+writer-level guarantees had been established for them -- in particular
+**no delete files**, which the splice hard-depends on (it copies
+`DataFileContent.DATA` and never looks at a scan task's `delete_files`, so a
+merge-on-read source would have its deletes dropped and deleted rows would
+come back to life in the target).
+
+Fivetran's data lake setup has a toggle that lets Fivetran register your
+tables in a Glue catalog, and it is worth being clear about what that
+toggle does: it changes **where table metadata is registered**, not how the
+data was written.
+
+Catalog registration and data writing are separate concerns. Registering a
+table in a catalog records where its metadata lives; it does not produce
+Parquet, manifests or statistics, and it cannot change how they were
+produced. The same managed data lake writer produces the files whether they
+are registered in Polaris, Glue, or several catalogs at once.
+
+So the catalog sits *below* the data writer. Parquet files, manifest
+statistics, field-id assignment and copy-on-write semantics are properties
+of the writer, not of the catalog.
+
+Two consequences. The no-delete-files expectation extends to a
+customer-managed Glue destination, so that open risk is closed. And a
+Polaris lake is a valid proxy for a Glue deployment's *file-level*
+behaviour, which is worth knowing for future testing -- only the catalog
+mechanics differ, and those are now covered by `tests/test_glue_live.py`.
+
+`scripts/diagnose_sources.py` keeps checking for delete files regardless: it
+costs nothing, it covers sources this tool was never aimed at, and it would
+catch the guarantee changing upstream.
+
+### Verified on a real AWS Glue Data Catalog -- both carried-over assumptions confirmed
+
+The Glue path had never been run against a live Glue catalog; everything was
+either inherited from Polaris testing or verified against a local SQLite
+catalog. `tests/test_glue_live.py` now closes that, and the two assumptions
+`examples/aws-glue/README.md` has carried since the Glue path was written are
+findings rather than expectations:
+
+1. **The reserved-field-id trick holds on Glue.** `create_target_table()`
+   forces `source_connection_id` to field id 100000 by assigning an
+   `itertools.count` to a *private* pyiceberg `UpdateSchema` attribute. On a
+   live Glue catalog it lands at exactly 100000.
+2. **Glue's `CreateTable` does not renumber field ids.** Asked for 1-4, got
+   1-4. The two-step create-then-widen dance stays correct and needs nothing
+   Glue-specific.
+
+Also confirmed live on Glue rather than only locally: no row loss, no rerun
+duplication, NULLs preserved, no field-id crossover, manifest bounds matching
+declared types (the Snowflake symptom), and a clean `verify_consolidation.py`
+-- 9/9.
+
+Sources are created by the test to mimic Fivetran's metadata shape
+(per-tenant tables, identical names and types, divergent field ids, NULLs in
+the drifted column), because the catalog this was developed against is not
+fed by Fivetran. Field-id layout is pure metadata, so provenance does not
+affect what is under test.
+
+Opt-in, since it creates real AWS resources and costs real (trivial) money:
+
+```bash
+ULT_LIVE_GLUE=1 python tests/test_glue_live.py
+```
+
+Timestamped databases and bucket, removed in a `finally` block. Worth
+re-running after any pyiceberg upgrade -- both findings depend on library
+internals that can change with no deprecation warning.
+
+### Fixed: two more correctness gaps, found by probing for them deliberately
+
+Phase 1 of the agreed plan is "make it account for everything, even if that
+means a lot of rewriting." Two gaps beyond the NULL bug below, both found by
+writing probes for the cases nobody had tried rather than by waiting for a
+report. Both produce a **broken run that reports success**.
+
+**1. A source carrying a column the baseline lacks crashed the whole run.**
+The rewrite appends a source's ENTIRE column set, but only registered the one
+colliding column (`add_column(name, ftype)`). Any other column the target did
+not already have aborted the append:
+
+```
+ValueError: PyArrow table contains more columns: extra.
+Update the schema first (hint, use union_by_name).
+```
+
+Nothing committed for that table. Not exotic either: `discover_common_tables()`
+intersects table NAMES, never column names, so a tenant whose connector is
+newer legitimately carries extra columns. The splice path's widen step cannot
+cover it, because `file_has_drift_beyond()` returns the FIRST mismatching id
+and stops -- for an already-divergent source that is the divergent id, so a
+later extra column is never examined. Now `union_by_name(src_schema)`, which
+registers every missing column by name, leaves existing ones alone, and never
+renumbers.
+
+**2. Type divergence was spliced silently and made the target unreadable.**
+Drift detection compares a field id's NAME against the target's, never its
+TYPE. The target inherits `source_namespaces[0]`'s types -- so a source
+holding `long` where the baseline holds `int` sailed through the no-rewrite
+path. Two-source probe: **12 rows spliced, 0 rewritten, run reports success**,
+and the first read of the target dies with
+
+```
+pyiceberg.exceptions.ResolveError: Cannot promote long to int
+```
+
+because the file holds 8-byte values and the schema promises 4. Same class as
+a warehouse rejecting a bound whose width does not match the declared
+type: a manifest describing bytes that are not what it says.
+
+Fixed by `promote_target_types_to_widest()`, which widens the TARGET to the
+widest type any source uses before anything is spliced. **This costs zero
+rewrites** -- Iceberg reads a narrow file through a wider schema, so widening
+the target makes every source's existing files valid where they are, with no
+field id moving. Deliberately not a blanket `union_by_name` over every source,
+which would also be correct but would add absent columns at fresh ids
+(100001+) instead of at the source's own physical id, forfeiting the splice
+for exactly the sources the widen path exists to keep cheap.
+
+Irreconcilable types (`string` vs `int`) now abort with an actionable message
+instead of silently picking one and corrupting the other source.
+
+### Fixed: the collision-rewrite path dropped NULL rows and duplicated on reruns
+
+Predicted by reading the code while fixing the Glue fork, then **reproduced
+in a multi-source deployment, and now fixed with
+regression tests.
+
+**The shape of it.** A table whose sources assign different field ids to the
+same column, so most sources take the rewrite path. Every source whose
+drifted column contained NULLs came up short in the target by *exactly* the
+number of NULLs in that column; sources whose drifted column had none lost
+nothing. The run reported success throughout, and
+`verify_consolidation.py`'s per-source row counts were what surfaced it.
+
+**Also confirmed: reruns duplicate.** Our reproduction shows the losing
+source going 6 rows → 12 rows on a second run while the source has 10. The guard compared a non-null row count against a
+total record count, so with any NULLs present it could never fire.
 
 When sources' base schemas disagree about a field id, the divergent source's
 files are excluded from splicing entirely (`register_table()` step 3), so
@@ -109,28 +246,75 @@ is filtered:
 tab = src_table.scan(row_filter=f"{name} is not null").to_arrow()
 ```
 
-Two consequences follow, if this reading is right:
+Two consequences, both now confirmed:
 
 1. **Rows where the drifted column is NULL never land at all.** They are
    excluded from the splice and then filtered out of the rewrite.
-2. **Reruns duplicate.** The idempotency guard compares `already_rewritten`
+2. **Reruns duplicate.** The idempotency guard compared `already_rewritten`
    (rows where `name is not null`) against
    `expected_rows = sum(f.record_count for f in to_rewrite)` (every row in
    those files). With any nulls present, `already_rewritten < expected_rows`
-   is permanently true, so the guard never trips and the non-null rows are
+   is permanently true, so the guard never tripped and the non-null rows were
    appended again on every subsequent run.
 
 **Why existing validation could not have caught it.** The two-source
 reproduction used `clicks`/`ctr`, non-null in every row -- so nothing was
 dropped, `already_rewritten == expected_rows` exactly, and run 2 was a clean
-no-op. That is precisely the case where both bugs are invisible. A sparsely
-populated column (the reporting customer's
-`excludeallsecuritiesfromperformance` is a nullable boolean) would hit both
-on the first run.
+no-op. That is precisely the case where both bugs are invisible. Any sparsely
+populated nullable column hits both on the first run.
 
-`verify_consolidation.py`'s per-source row-count check should surface this as
-a mismatch, which makes it the test: run a consolidation where a divergent
-source's drifted column contains nulls, then verify. Not attempted here.
+**The fix, and the trap in the obvious version of it.** The natural repair --
+drop the filter, read the whole source -- is correct for base-schema
+divergence, where every file drifts, and **wrong** for ordinary drift, where
+only recent files carry the new column: step 3 splices that source's
+non-drifted files in by reference, so re-reading the whole table appends
+those rows a second time. That trades row loss for row duplication, and data
+where every file drifts would never reveal it. Verified
+against the pre-fix code, which loses 3 rows and then duplicates 2 on the
+ordinary-drift path.
+
+So the rewrite now reads **exactly the drifted files and nothing else**, via
+`ArrowScan(...).to_table(to_rewrite_tasks)` with no row filter. Going through
+`ArrowScan` rather than reading the Parquet directly also applies the
+source's Iceberg schema, so a file written before a column existed still
+yields that column as NULL rather than coming back missing. It stays a single
+`to_table()` call, preserving the one-scan property that fixed the earlier
+duplicate-per-drifted-file bug.
+
+The guard now compares **like with like**: total rows present in the target
+for this source versus total rows the source actually has, both summed from
+manifest `record_count` rather than by scanning data. Being metadata-only
+makes it exact and free, and it retires the `MultiSourceFileIO` swap this
+block used to need -- counting rows meant reading spliced files that live
+under the *source's* storage location, which the target's vended credential
+cannot reach (the ACCESS_DENIED issue noted below). Summing `record_count`
+opens no data file at all, so `register_consolidation.py` no longer imports
+`MultiSourceFileIO`; `verify_consolidation.py` still does, legitimately.
+
+**Regression tests** added at `tests/test_collision_rewrite.py`, runnable
+with plain `python` or `pytest` against a local SQLite catalog -- no Polaris,
+no Glue, no AWS, no network (needs `sqlalchemy` on top of
+`requirements.txt`). Two cases, `test_base_schema_divergence` (every file
+drifts) and `test_ordinary_drift` (only some do --
+the trap above). Both **fail against the pre-fix code and pass after**, which
+is the only thing that makes them worth having:
+
+```
+### pre-fix
+FAIL  test_base_schema_divergence: expected 20 rows, got 22
+FAIL  test_ordinary_drift: expected 20 rows, got 19
+### fixed
+PASS  test_base_schema_divergence
+PASS  test_ordinary_drift
+```
+
+One detail worth recording, because it cost a cycle: the NULLs have to sit in
+the column the **collision names for the losing source**, not merely in some
+nullable column. A first draft put them elsewhere and passed cleanly against
+the known-broken code.
+
+`verify_consolidation.py`'s per-source row-count check is what surfaces this,
+and remains the right post-run gate.
 
 ### Added: Delta Lake support (experimental) -- one set of files, two metadata layers
 
@@ -158,7 +342,7 @@ Databricks runs:
 **The interesting finding is that Delta is structurally *easier* here than
 Iceberg**, which inverts the usual expectation. Delta resolves columns by
 NAME, so the entire field-id collision problem -- the reserve / widen /
-rewrite machinery, and the base-schema divergence bug a customer hit -- is
+rewrite machinery, and the base-schema divergence bug -- is
 not reachable with column mapping off. And a Delta partition column is
 *expected* to be absent from the data files and supplied by the log, which
 is exactly this tool's situation; Iceberg needed a reserved out-of-band
@@ -603,11 +787,11 @@ Found via a piece of external feedback on this technique, then reproduced
 live (not hypothetical) before being fixed. The 1.0.0 release's "Explicitly
 out of scope" section named the wrong mechanism for this risk -- it said
 "merge-on-read sources (delete files)," but reading Fivetran's actual
-Managed Data Lake writer source (`ManagedDataLakeWriter.java`) shows there
+managed data lake writer's actual behaviour shows there
 are no delete files anywhere in that writer at all. `upsert()`, `update()`,
 and `delete()` all use pure copy-on-write: the writer finds every existing
 physical file that could contain an affected primary key, rewrites it in
-full via an internal `UpdateWorkflow`/`DeleteWorkflow`, and atomically swaps
+full, and atomically swaps
 old file for new via Iceberg's `OverwriteFiles` transaction
 (`deleteFile()` + `addFile()` in one commit). No position or equality
 deletes, no `write.delete.mode`/`write.update.mode` table properties set
@@ -733,7 +917,7 @@ next entry.
 Found while testing renamed columns -- specifically, the case where a
 connector stops emitting one column name and starts emitting another (e.g.
 `color` -> `hue`). First confirmed, by reading
-`ManagedDataLakeSchemaMigrator.java`, that this isn't a real Iceberg rename
+the writer's schema-migration behaviour, that this isn't a real Iceberg rename
 at all: there's no name-similarity inference anywhere in Fivetran's
 migration-step planner, so a new column name from a connector is always
 plain `addColumn()` with a brand-new field id, mechanically identical to

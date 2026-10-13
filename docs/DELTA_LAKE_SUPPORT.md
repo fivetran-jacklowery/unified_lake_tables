@@ -35,7 +35,7 @@ expectation.
 **Delta resolves columns by name. Iceberg resolves by field id.** Most of
 `register_consolidation.py`'s complexity — the reserve / widen-for-free /
 rewrite-on-collision machinery, plus the base-schema divergence guard added
-after a customer hit it — exists because Iceberg matches columns by an
+after it was hit in practice — exists because Iceberg matches columns by an
 integer baked into each Parquet file, so two sources can disagree about what
 an id means and Iceberg will silently return the wrong column. With column
 mapping off, Delta reads column names straight out of the Parquet footer.

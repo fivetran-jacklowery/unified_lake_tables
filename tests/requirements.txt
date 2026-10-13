@@ -1,0 +1,10 @@
+# Test-only dependencies, on top of the repo root requirements.txt.
+#
+# pyiceberg's SqlCatalog backs the tests with a local SQLite catalog and a
+# file:// warehouse, so the whole suite runs with no Polaris, no Glue, no
+# AWS and no network. sqlalchemy is what SqlCatalog needs and the runtime
+# tool does not.
+sqlalchemy>=2.0
+
+# Optional -- the tests also run under plain `python tests/<file>.py`.
+# pytest==8.3.4

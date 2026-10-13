@@ -55,7 +55,7 @@ flagging it. That's the bug this tool's correctness layer exists to prevent.
 glob pattern (`source_namespace_pattern`, e.g. `"tenant_*"`) -- pick
 whichever fits your scale. An explicit list is fine for a handful of
 sources. At real scale (the scale this tool is actually built for --
-Ecolab-style 400+ Azure SQL databases, Andersen-style 10,000+ ERP tables),
+hundreds of per-tenant databases, or many thousands of ERP tables),
 hand-listing every namespace defeats the point.
 
 `resolve_source_namespaces()` handles the pattern case: it calls the
@@ -208,14 +208,33 @@ source. That assumption is wrong the moment a source does a genuine
 row-level UPDATE or DELETE, and it went unverified in this tool's 1.0.0
 release, which cited the wrong mechanism for the risk ("merge-on-read
 sources / delete files" in the README and CHANGELOG). Reading Fivetran's
-actual Managed Data Lake writer source
-(`ManagedDataLakeWriter.java`) shows there are no delete files anywhere in
-it: `upsert()`, `update()`, and `delete()` all locate every existing
+managed data lake writer shows it never emits delete files.
+
+**This holds whatever catalog you use, including a customer-managed AWS Glue
+Data Catalog.** Worth stating explicitly, because it looks like it should
+depend on the destination and does not. Fivetran's data lake setup has a
+toggle that lets Fivetran register your tables in Glue, and it is tempting
+to read that as "a different destination, therefore a different writer, so
+none of the guarantees below have been established for it." That is not how it
+works. Catalog registration and data writing are separate concerns:
+registering a table in a catalog records *where its metadata lives*, and
+nothing more. It does not produce Parquet, manifests or statistics, and it
+cannot change how they were produced. The same managed data lake writer
+produces the files whether they are registered in Polaris, Glue, or more
+than one catalog at once -- which is exactly what the Glue toggle enables.
+
+So the catalog sits *below* the data writer. Parquet files, manifest
+statistics (`null_value_counts`, bounds -- which this tool's drift detection
+hard-depends on), field-id assignment, and copy-on-write semantics are
+properties of the writer, not of the catalog you register into.
+
+If you want to confirm it for your own tables rather than take it on trust,
+`scripts/diagnose_sources.py` checks both properties directly, read-only.
+
+Concretely: `upsert()`, `update()`, and `delete()` all locate every existing
 physical file that could contain an affected primary key, rewrite each one
-in full via an internal `UpdateWorkflow`/`DeleteWorkflow`, and commit the
-swap atomically via Iceberg's `OverwriteFiles` transaction
-(`deleteFile()` + `addFile()` in one commit, confirmed in the writer's
-`commit()` method). No `write.delete.mode`/`write.update.mode`/
+in full, and commit the swap atomically via Iceberg's `OverwriteFiles`
+transaction (`deleteFile()` + `addFile()` in one commit). No `write.delete.mode`/`write.update.mode`/
 `write.merge.mode` table properties are set anywhere -- copy-on-write (COW)
 is the only path this writer implements, not a configurable choice.
 
@@ -337,7 +356,7 @@ section.
 ### 6. Renamed columns: two scenarios, one fixed, one still open
 
 "Renamed columns" turned out not to be one thing. Reading Fivetran's
-`ManagedDataLakeSchemaMigrator.java` first (not assuming) settled which
+the writer's actual schema-migration behaviour first (not assuming) settled which
 scenarios are even possible: a connector cannot cause a true, field-id-
 preserving Iceberg rename on its own. There's no name-similarity or
 rename-inference logic anywhere in Fivetran's migration-step planner --

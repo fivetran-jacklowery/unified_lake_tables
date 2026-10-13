@@ -171,7 +171,7 @@ running this against a source that has done any of them could produce
 
 - **Renamed columns -- tested, and it's actually two different scenarios
   with two different outcomes.** Reading Fivetran's real
-  `ManagedDataLakeSchemaMigrator.java` first (not assuming): a connector
+  the writer's actual schema-migration behaviour first (not assuming): a connector
   can't cause a true Iceberg rename at all. If a connector just stops
   emitting one column name and starts emitting another, that's plain
   `addColumn()` under the hood -- a brand-new field id, no different from
