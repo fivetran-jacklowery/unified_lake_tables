@@ -66,12 +66,13 @@ import yaml
 from dotenv import load_dotenv
 from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.rest import RestCatalog
+from pyiceberg.expressions import AlwaysTrue
+from pyiceberg.io.pyarrow import ArrowScan
 from pyiceberg.manifest import DataFile, DataFileContent
 from pyiceberg.schema import Schema
 from pyiceberg.typedef import Record
 from pyiceberg.types import StringType
 
-from multi_source_io import MultiSourceFileIO
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -1038,14 +1039,22 @@ def register_table(table_name: str, cfg: dict) -> tuple:
     #    pipeline, and only for the small sliver of genuinely-colliding new
     #    data, never the historical bulk.
     rewritten_rows = 0
+    # Recomputed AFTER step 3's commit, so it reflects what is actually in the
+    # target right now. The guard below counts rows from this rather than
+    # scanning data, which is both exact and free -- see there.
+    already_by_source_now, _ = already_registered_by_source(target_table)
     for ns, field_id, name, ftype in rewrite_needed:
         src_schema, files = files_by_source[ns]
-        to_rewrite = [
-            task.file
+        # Keep the TASKS, not just the DataFiles. The rewrite below reads
+        # exactly these files through ArrowScan, and that needs FileScanTask
+        # objects. to_rewrite is derived from them for the row-count math.
+        to_rewrite_tasks = [
+            task
             for task in files
             if task.file.file_path not in already
             and file_has_drift_beyond(task.file, known_field_names, src_schema) == field_id
         ]
+        to_rewrite = [task.file for task in to_rewrite_tasks]
         if not to_rewrite:
             continue
 
@@ -1053,54 +1062,40 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         column_already_exists = name in {f.name for f in target_table.schema().fields}
 
         if column_already_exists:
-            # The column is already registered. With the atomic fix below,
+            # The column is already registered. With the atomic commit below,
             # that alone would normally be enough to know its data is there
-            # too -- but a run from BEFORE this fix could have left the
+            # too -- but a run from BEFORE that fix could have left the
             # column registered with none of this source's data ever
             # appended (see CHANGELOG.md "Fixed: silent field-id collision
             # misattribution" and file_has_drift_beyond()'s docstring for
-            # the full mechanism). Check row content explicitly rather than
-            # trusting "column exists" alone, so a pre-existing broken state
-            # gets healed instead of silently staying broken.
+            # the full mechanism). Check explicitly rather than trusting
+            # "column exists" alone, so a pre-existing broken state gets
+            # healed instead of silently staying broken.
             #
-            # This scan's row_filter restricts to source_id_column = ns, but
-            # the matching files (spliced in by reference in a prior run,
-            # per this tool's whole no-rewrite design) still physically
-            # live under NS's OWN storage location, not the target's -- and
-            # Polaris only ever vends the target table's credential scoped
-            # to the target's own location. Reading through target_table.io
-            # alone hits AWS ACCESS_DENIED here (reproduced live, see
-            # CHANGELOG.md's "Known issue: collision-rewrite path can hit
-            # ACCESS_DENIED under vended credentials"). Temporarily swap in
-            # a FileIO that also tries this source's own vended credential
-            # -- src_table.io -- before falling back to failure; restore
-            # the target's own IO immediately after.
-            # source_id_column MUST stay in selected_fields even though only
-            # `name` is counted. The target is identity-partitioned on
-            # source_id_column, and pyiceberg's _get_column_projection_values
-            # resolves the partition source field against the PROJECTED
-            # schema, not the table schema:
-            #     partition_schema = partition_spec.partition_type(projected_schema)
-            # That line is reached whenever the projection contains a field id
-            # the physical file lacks -- which is always true here, because a
-            # collision gives `name` a fresh out-of-band field id that no
-            # spliced source file physically carries. Projecting `name` alone
-            # therefore crashes with "ValueError: Could not find field with
-            # id: <reserved id>" (reproduced live 2026-09-10 on a real
-            # two-source collision). Keeping source_id_column in the
-            # projection puts the partition source field in the projected
-            # schema, so it resolves and the identity value backfills.
-            original_io = target_table.io
-            target_table.io = MultiSourceFileIO([target_table.io, src_table.io])
-            try:
-                already_rewritten = target_table.scan(
-                    row_filter=f"{source_id_column} = '{ns}' and {name} is not null",
-                    selected_fields=(name, source_id_column),
-                ).to_arrow().num_rows
-            finally:
-                target_table.io = original_io
-            expected_rows = sum(f.record_count for f in to_rewrite)
-            if already_rewritten >= expected_rows:
+            # COUNT LIKE WITH LIKE. This guard used to compare
+            #     target rows WHERE source = ns AND <name> IS NOT NULL
+            # against
+            #     sum(record_count) over the drifted files   (ALL rows)
+            # -- a non-null row count on the left, a total row count on the
+            # right. Any NULL at all in the drifted column made the left side
+            # permanently smaller, so the guard never fired and every rerun
+            # re-appended. Reproduced by a customer on 2026-10-13 against six
+            # tenants: 80 rows short, exactly matching the 80 NULLs, with the
+            # three null-free sources losing nothing. See CHANGELOG.md.
+            #
+            # Both sides are now total row counts for this source, taken from
+            # MANIFEST METADATA rather than by scanning data. That is exact,
+            # free, and it also retires the MultiSourceFileIO/ACCESS_DENIED
+            # dance this block used to need: counting rows meant reading
+            # spliced files that physically live under the SOURCE's storage
+            # location, which the target's vended credential cannot reach.
+            # Summing record_count never opens a data file at all.
+            target_rows_for_ns = sum(
+                df.record_count for df in already_by_source_now.get(ns, {}).values()
+            )
+            source_rows_for_ns = sum(task.file.record_count for task in files)
+            already_rewritten, expected_rows = target_rows_for_ns, source_rows_for_ns
+            if target_rows_for_ns >= source_rows_for_ns:
                 logger.info(
                     "  [%s] '%s' from %s: %d row(s) already rewritten/appended in a prior run, skipping",
                     table_name,
@@ -1132,21 +1127,46 @@ def register_table(table_name: str, cfg: dict) -> tuple:
                 expected_rows,
             )
 
-        # ONE scan, not one per file in to_rewrite. This used to be a
-        # `for f in to_rewrite:` loop whose body never referenced `f` -- it
-        # re-ran the identical whole-table scan on every iteration and
-        # appended every copy, so a source with N drifted files had its
-        # drifted rows landed N times over. Reproduced live against a
-        # purpose-built two-source collision (see CHANGELOG.md):
-        # 7 drifted files produced 175,000 rows where 25,000 were correct,
-        # an exact 7x. See CHANGELOG.md "Fixed: collision rewrite appended
-        # one duplicate copy per drifted file".
+        # Read EXACTLY the drifted files, every row, NULLs preserved.
         #
-        # A single scan is already complete: `name is not null` selects every
-        # drifted row across all of this source's files at once, which is
-        # exactly what the rewrite needs. to_rewrite is still what decides
-        # WHETHER there is anything to rewrite, and how many rows to expect.
-        tab = src_table.scan(row_filter=f"{name} is not null").to_arrow()
+        # This used to be `src_table.scan(row_filter=f"{name} is not null")`,
+        # and that filter silently dropped rows. For base-schema divergence
+        # the source's files are ALL excluded from splicing above, so this
+        # append is the ONLY path those rows have into the target -- and any
+        # row whose drifted column was NULL was filtered right back out of
+        # it. Customer-reproduced 2026-10-13: 80 rows short across six
+        # tenants, exactly equal to the 80 NULLs, with the three null-free
+        # sources losing nothing. See CHANGELOG.md.
+        #
+        # The fix is NOT simply dropping the filter. A whole-table scan would
+        # be correct for base-schema divergence (where every file is drifted)
+        # but WRONG for ordinary drift, where only recent files carry the new
+        # column: step 3 splices this source's non-drifted files in by
+        # reference, so re-reading the whole table here would append those
+        # rows a second time. That trades a row-loss bug for a row-duplication
+        # bug -- and Tamarac-shaped data, where every file drifts, would not
+        # have shown it.
+        #
+        # So scan the drifted files and nothing else. ArrowScan takes the
+        # FileScanTasks directly, which is also why to_rewrite_tasks is kept
+        # above. Going through ArrowScan rather than reading the Parquet with
+        # pyarrow directly matters: it applies the source's Iceberg schema, so
+        # a file written before some column existed still yields that column
+        # as NULL instead of coming back missing.
+        #
+        # Still ONE scan, not one per file -- this was previously a
+        # `for f in to_rewrite:` loop whose body never referenced `f`, which
+        # re-ran the identical whole-table scan per iteration and appended
+        # every copy (7 drifted files produced an exact 7x row count; see
+        # CHANGELOG.md "Fixed: collision rewrite appended one duplicate copy
+        # per drifted file"). Passing every task to a single to_table() call
+        # keeps that property structurally.
+        tab = ArrowScan(
+            src_table.metadata,
+            src_table.io,
+            src_schema,
+            AlwaysTrue(),
+        ).to_table(to_rewrite_tasks)
         if tab.num_rows == 0:
             continue
         tab = tab.append_column(source_id_column, pa.array([ns] * tab.num_rows, type=pa.string()))

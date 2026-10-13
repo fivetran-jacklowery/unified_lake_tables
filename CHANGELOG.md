@@ -93,12 +93,32 @@ tables. The two carried-over assumptions in
 `examples/aws-glue/README.md` -- the reserved-field-id trick and whether
 Glue's `CreateTable` renumbers field ids -- remain open.
 
-### Open, unverified: the rewrite path looks like it drops rows, and double-counts on reruns
+### Fixed: the collision-rewrite path dropped NULL rows and duplicated on reruns
 
-Found by reading the code while fixing the Glue fork, **not yet reproduced
-against live data.** Flagging it now because collapsing the fork routes Glue
-users onto this exact path, and the customer above would land on it
-immediately.
+Predicted by reading the code while fixing the Glue fork, then **reproduced
+by the customer on 2026-10-13** against six tenants, and now fixed with
+regression tests.
+
+**The customer's numbers.** Table `account`, 48 columns, 14 with divergent
+field ids. One tenant spliced; five took the rewrite path. Two failed
+`verify_consolidation.py`:
+
+| Tenant | Drifted column | Source rows | NULLs | Rows missing |
+|---|---|---|---|---|
+| integratedan | `tamaccountid` | 30,526 | 15 | **15** |
+| rockefeller | `tamaccountid` | 3,518,879 | 65 | **65** |
+| fcacorp | `tamaccountid` | 2,736 | 0 | 0 |
+| klingman | `sleevelevelreportingenabled` | 11,332 | 0 | 0 |
+| evermaywm | `excludeallsecuritiesfromperformance` | 19,450 | 0 | 0 |
+
+80 missing rows, 80 NULLs, exact match; the three null-free sources lost
+nothing. Their report also notes the scale of the underlying divergence:
+**902 of 2,255 columns across 138 tables** carry different ids per tenant.
+
+**Also confirmed, which the customer had not tested:** reruns duplicate. Our
+reproduction shows the losing source going 6 rows → 12 rows on a second run
+while the source has 10. The guard compared a non-null row count against a
+total record count, so with any NULLs present it could never fire.
 
 When sources' base schemas disagree about a field id, the divergent source's
 files are excluded from splicing entirely (`register_table()` step 3), so
@@ -109,15 +129,15 @@ is filtered:
 tab = src_table.scan(row_filter=f"{name} is not null").to_arrow()
 ```
 
-Two consequences follow, if this reading is right:
+Two consequences, both now confirmed:
 
 1. **Rows where the drifted column is NULL never land at all.** They are
    excluded from the splice and then filtered out of the rewrite.
-2. **Reruns duplicate.** The idempotency guard compares `already_rewritten`
+2. **Reruns duplicate.** The idempotency guard compared `already_rewritten`
    (rows where `name is not null`) against
    `expected_rows = sum(f.record_count for f in to_rewrite)` (every row in
    those files). With any nulls present, `already_rewritten < expected_rows`
-   is permanently true, so the guard never trips and the non-null rows are
+   is permanently true, so the guard never tripped and the non-null rows were
    appended again on every subsequent run.
 
 **Why existing validation could not have caught it.** The two-source
@@ -128,9 +148,58 @@ populated column (the reporting customer's
 `excludeallsecuritiesfromperformance` is a nullable boolean) would hit both
 on the first run.
 
-`verify_consolidation.py`'s per-source row-count check should surface this as
-a mismatch, which makes it the test: run a consolidation where a divergent
-source's drifted column contains nulls, then verify. Not attempted here.
+**The fix, and the trap in the obvious version of it.** The natural repair --
+drop the filter, read the whole source -- is correct for base-schema
+divergence, where every file drifts, and **wrong** for ordinary drift, where
+only recent files carry the new column: step 3 splices that source's
+non-drifted files in by reference, so re-reading the whole table appends
+those rows a second time. That trades row loss for row duplication, and
+Tamarac-shaped data (every file drifting) would never reveal it. Verified
+against the pre-fix code, which loses 3 rows and then duplicates 2 on the
+ordinary-drift path.
+
+So the rewrite now reads **exactly the drifted files and nothing else**, via
+`ArrowScan(...).to_table(to_rewrite_tasks)` with no row filter. Going through
+`ArrowScan` rather than reading the Parquet directly also applies the
+source's Iceberg schema, so a file written before a column existed still
+yields that column as NULL rather than coming back missing. It stays a single
+`to_table()` call, preserving the one-scan property that fixed the earlier
+duplicate-per-drifted-file bug.
+
+The guard now compares **like with like**: total rows present in the target
+for this source versus total rows the source actually has, both summed from
+manifest `record_count` rather than by scanning data. Being metadata-only
+makes it exact and free, and it retires the `MultiSourceFileIO` swap this
+block used to need -- counting rows meant reading spliced files that live
+under the *source's* storage location, which the target's vended credential
+cannot reach (the ACCESS_DENIED issue noted below). Summing `record_count`
+opens no data file at all, so `register_consolidation.py` no longer imports
+`MultiSourceFileIO`; `verify_consolidation.py` still does, legitimately.
+
+**Regression tests** added at `tests/test_collision_rewrite.py`, runnable
+with plain `python` or `pytest` against a local SQLite catalog -- no Polaris,
+no Glue, no AWS, no network (needs `sqlalchemy` on top of
+`requirements.txt`). Two cases, `test_base_schema_divergence` (every file
+drifts -- the customer's shape) and `test_ordinary_drift` (only some do --
+the trap above). Both **fail against the pre-fix code and pass after**, which
+is the only thing that makes them worth having:
+
+```
+### pre-fix
+FAIL  test_base_schema_divergence: expected 20 rows, got 22
+FAIL  test_ordinary_drift: expected 20 rows, got 19
+### fixed
+PASS  test_base_schema_divergence
+PASS  test_ordinary_drift
+```
+
+One detail worth recording, because it cost a cycle: the NULLs have to sit in
+the column the **collision names for the losing source**, not merely in some
+nullable column. A first draft put them elsewhere and passed cleanly against
+the known-broken code.
+
+`verify_consolidation.py`'s per-source row-count check is what surfaced this
+at the customer, and remains the right post-run gate.
 
 ### Added: Delta Lake support (experimental) -- one set of files, two metadata layers
 

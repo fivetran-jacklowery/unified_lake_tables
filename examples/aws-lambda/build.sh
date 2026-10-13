@@ -69,8 +69,12 @@ fi
 echo "Copying handler and shared consolidation script ..."
 cp "$HERE/lambda_function.py" "$BUILD_DIR/"
 cp "$REPO_ROOT/scripts/register_consolidation.py" "$BUILD_DIR/"
-# register_consolidation.py imports this at module level -- without it the
-# package fails at Lambda cold start with ModuleNotFoundError.
+# register_consolidation.py used to import this at module level, and omitting
+# it failed at Lambda cold start with ModuleNotFoundError. That import went
+# away when the collision-rewrite guard stopped scanning data (it now counts
+# rows from manifest metadata, so it never needs a cross-source FileIO).
+# Still shipped: it costs ~2KB, and it keeps this package working if any
+# module here starts importing it again.
 cp "$REPO_ROOT/scripts/multi_source_io.py" "$BUILD_DIR/"
 
 UNTRIMMED_SIZE=$(du -sh "$BUILD_DIR" | cut -f1)

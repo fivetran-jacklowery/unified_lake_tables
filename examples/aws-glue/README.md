@@ -125,20 +125,27 @@ large first run proceed. See the repo root `CHANGELOG.md` for the measured
 difference between base-schema divergence (~100% of files, loud warning) and
 ordinary drift (recent files only, quiet INFO).
 
-### Known issue on that rewrite path — read before relying on the result
+### Fixed in this version: NULL rows were dropped on the rewrite path
 
-There is an **open, unverified** finding that the rewrite path may drop rows
-and double-count them on reruns: rows where the drifted column is NULL look
-like they never land, and the idempotency guard looks like it never trips
-when nulls are present, re-appending on every run. It is a code reading, not
-yet reproduced — full detail in the repo root `CHANGELOG.md`.
+If you ran an **earlier** build, consolidated tables produced by it may be
+missing rows. A customer hit this on 2026-10-13: rows whose drifted column
+was NULL never reached the target (80 missing across six tenants, exactly
+matching the 80 NULLs), and reruns duplicated the rows that did land. Both
+are fixed, with regression tests at `tests/test_collision_rewrite.py`. Full
+detail in the repo root `CHANGELOG.md`.
 
-It matters here because base-schema field-id divergence is exactly what puts
-a source on that path, and it is the common case for per-tenant replicas.
+It bit on Glue specifically because base-schema field-id divergence is what
+routes a source onto the rewrite path, and that is the normal case for
+per-tenant replicas.
 
-Always run `scripts/verify_consolidation.py` after a consolidation that
-reported any rewrites. Its per-source row-count check is what would catch
-this, and a mismatch there means do not trust the target table.
+**If you consolidated with an earlier build, re-verify.** The target is not
+self-healing for the duplicate half — rerunning an affected table against an
+existing target can leave the extra rows in place. Safest is to drop the
+affected target tables and re-register from scratch.
+
+Either way, always run `scripts/verify_consolidation.py` after a
+consolidation that reported any rewrites. Its per-source row-count check is
+what caught this, and a mismatch means do not trust the target table.
 
 ## Setup
 
