@@ -142,9 +142,16 @@ findings rather than expectations:
    forces `source_connection_id` to field id 100000 by assigning an
    `itertools.count` to a *private* pyiceberg `UpdateSchema` attribute. On a
    live Glue catalog it lands at exactly 100000.
-2. **Glue's `CreateTable` does not renumber field ids.** Asked for 1-4, got
-   1-4. The two-step create-then-widen dance stays correct and needs nothing
-   Glue-specific.
+2. **Glue renumbers field ids on create, exactly like Polaris.** Asked for
+   `{a:5, b:3, c:9}`, got `{a:1, b:2, c:3}` -- sequential, in declaration
+   order. So the two-step create-then-widen dance is *required* on Glue, not
+   merely harmless, and it works.
+
+   Corrected from a first version of this entry, which claimed ids were
+   preserved. That test asked for ids 1-4 declared in that order -- which is
+   exactly what sequential renumbering produces, so it could not tell the two
+   apart. A test for this has to ask for ids that renumbering would visibly
+   destroy; the live test now does.
 
 Also confirmed live on Glue rather than only locally: no row loss, no rerun
 duplication, NULLs preserved, no field-id crossover, manifest bounds matching

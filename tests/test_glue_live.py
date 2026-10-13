@@ -17,8 +17,14 @@ unverified assumptions from the day the Glue path was written:
      internals, and "it should behave the same on any catalog" was an
      expectation, not a finding.
   B. Does Glue's own CreateTable renumber field ids? The two-step
-     create-then-widen dance exists because of how Polaris behaves; nobody
-     had checked Glue.
+     create-then-widen dance exists because catalogs renumber on create;
+     nobody had checked whether Glue does too.
+
+     NOTE on how to test B: ask for ids that are NOT 1..N in declaration
+     order. An earlier version of this test asked for 1,2,3,4 declared in
+     that order and concluded ids were "preserved" -- but sequential
+     renumbering produces exactly that, so the test could not tell the two
+     apart. It must ask for something renumbering would visibly destroy.
 
 Both now answered -- see CHANGELOG.md. Keep this runnable so they stay
 answered, because a pyiceberg or Glue upgrade can change either.
@@ -142,10 +148,22 @@ try:
         t.append(pa.table({c: DATA[db][c] for c in cols}).cast(schema.as_arrow()))
         print(f"  {db}: {({f.name: f.field_id for f in cat.load_table(f'{db}.widgets').schema().fields})}")
 
-    got_ids = {f.name: f.field_id for f in cat.load_table(f"{DB_A}.widgets").schema().fields}
-    want_ids = {f.name: f.field_id for f in SCHEMAS[DB_A].fields}
-    check("ASSUMPTION B: Glue CreateTable preserves field ids", got_ids == want_ids,
-          f"asked {want_ids}, got {got_ids}")
+    # ASSUMPTION B, tested discriminatingly: ask for non-sequential ids that
+    # sequential renumbering would visibly destroy.
+    probe_schema = Schema(
+        NestedField(5, "a", StringType(), required=False),
+        NestedField(3, "b", LongType(), required=False),
+        NestedField(9, "c", StringType(), required=False),
+    )
+    cat.create_table(f"{DB_A}.idprobe", schema=probe_schema)
+    probe_got = {f.name: f.field_id for f in cat.load_table(f"{DB_A}.idprobe").schema().fields}
+    probe_want = {f.name: f.field_id for f in probe_schema.fields}
+    renumbered_sequentially = probe_got == {"a": 1, "b": 2, "c": 3}
+    check("ASSUMPTION B: Glue renumbers field ids on create, like Polaris",
+          renumbered_sequentially,
+          f"asked {probe_want}, got {probe_got}"
+          + ("" if renumbered_sequentially else "  <- NEITHER preserved NOR sequential; "
+                                                "the create-then-widen dance assumes renumbering"))
 
     print("\n=== consolidate (CATALOG_BACKEND=glue) ===")
     cfg = {"source_namespaces": [DB_A, DB_B], "target_namespace": DB_T,
