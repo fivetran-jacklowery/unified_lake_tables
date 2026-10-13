@@ -210,7 +210,34 @@ release, which cited the wrong mechanism for the risk ("merge-on-read
 sources / delete files" in the README and CHANGELOG). Reading Fivetran's
 actual Managed Data Lake writer source
 (`ManagedDataLakeWriter.java`) shows there are no delete files anywhere in
-it: `upsert()`, `update()`, and `delete()` all locate every existing
+it.
+
+**This holds whatever catalog you use, including a customer-managed AWS Glue
+Data Catalog.** Worth stating explicitly, because it looks like it should
+depend on the destination and does not. Fivetran's data lake setup has a
+toggle that lets Fivetran register your tables in Glue, and it is tempting
+to read that as "a different destination, therefore a different writer, so
+none of the guarantees below have been established for it." The code says
+otherwise: `catalog_writer/CatalogWriter.java` is an interface whose entire
+surface is catalog-pointer management -- `registerTable(schema, table,
+newMetadataLocation)`, `updateTableMetadata(..., newMetadataLocation,
+oldMetadataLocation, ...)`, plus create/get/drop/count. It has **no**
+data-writing method at all. `GlueCatalogWriter` contains zero references to
+`DataFile`, `OverwriteFiles`, `RowDelta`, `addFile`, or any manifest API,
+and `ManagedDataLakeWriter` *owns* a `CatalogWriter` as an injected
+dependency rather than the reverse. `MultiCatalogWriter` fans one writer out
+to a `List<CatalogWriter>`, which is how a customer can have Polaris and
+Glue at once.
+
+So the catalog is pluggable *below* the data writer. Parquet files, manifest
+statistics (`null_value_counts`, bounds -- which this tool's drift detection
+hard-depends on), field-id assignment, and copy-on-write semantics are all
+produced by the same `ManagedDataLakeWriter` no matter which catalog writers
+are enabled. Verified against `ManagedDataLakeWriter.java`: zero
+merge-on-read call sites (`RowDelta`/`PositionDelete`/`EqualityDelete`/
+`write.{delete,update,merge}.mode`), six copy-on-write ones.
+
+Concretely: `upsert()`, `update()`, and `delete()` all locate every existing
 physical file that could contain an affected primary key, rewrite each one
 in full via an internal `UpdateWorkflow`/`DeleteWorkflow`, and commit the
 swap atomically via Iceberg's `OverwriteFiles` transaction

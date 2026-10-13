@@ -93,6 +93,51 @@ tables. The two carried-over assumptions in
 `examples/aws-glue/README.md` -- the reserved-field-id trick and whether
 Glue's `CreateTable` renumbers field ids -- remain open.
 
+### Established: the Glue toggle changes the catalog, not the writer
+
+A question worth recording because the intuition runs the wrong way. The
+lake this tool was developed against does not feed a Glue catalog; the
+reporting customer's does. That looks like a different destination and
+therefore a different code path, which would mean none of this tool's
+writer-level guarantees had been established for them -- in particular
+**no delete files**, which the splice hard-depends on (it copies
+`DataFileContent.DATA` and never looks at a scan task's `delete_files`, so a
+merge-on-read source would have its deletes dropped and deleted rows would
+come back to life in the target).
+
+Fivetran's data lake setup has a toggle that lets Fivetran register your
+tables in a Glue catalog. Reading the engineering source settles what that
+toggle actually does:
+
+- `catalog_writer/CatalogWriter.java` is an interface whose entire surface
+  is catalog-pointer management -- `registerTable(schema, table,
+  newMetadataLocation)`, `updateTableMetadata(..., newMetadataLocation,
+  oldMetadataLocation, ...)`, plus create/get/drop/count/refresh. **No
+  data-writing method at all.**
+- `GlueCatalogWriter.java` has **zero** references to `DataFile`,
+  `OverwriteFiles`, `RowDelta`, `addFile` or any manifest API.
+- `ManagedDataLakeWriter` *owns* a `CatalogWriter` as an injected dependency,
+  not the reverse.
+- `MultiCatalogWriter` fans one writer out to a `List<CatalogWriter>`, which
+  is how a customer runs Polaris and Glue simultaneously.
+
+So the catalog is pluggable *below* the data writer. Parquet files, manifest
+statistics, field-id assignment and copy-on-write semantics come from the
+same `ManagedDataLakeWriter` whichever catalog writers are enabled --
+verified in that file: **zero** merge-on-read call sites
+(`RowDelta`/`PositionDelete`/`EqualityDelete`/`write.{delete,update,merge}.mode`),
+**six** copy-on-write ones.
+
+Two consequences. The no-delete-files guarantee **does** extend to a
+customer-managed Glue destination, so that open risk is closed. And a
+Polaris lake is a valid proxy for a Glue customer's *file-level* behaviour,
+which is worth knowing for future testing -- only the catalog mechanics
+differ, and those are now covered by `tests/test_glue_live.py`.
+
+`scripts/diagnose_sources.py` keeps checking for delete files regardless: it
+costs nothing, it covers sources this tool was never aimed at, and it would
+catch the guarantee changing upstream.
+
 ### Verified on a real AWS Glue Data Catalog -- both carried-over assumptions confirmed
 
 The Glue path had never been run against a live Glue catalog; everything was

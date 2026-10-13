@@ -25,11 +25,21 @@ with pyiceberg and reads them with pyiceberg will always agree with itself.
   2. NO DELETE FILES. The splice copies DataFileContent.DATA and never looks
      at a scan task's delete_files. A merge-on-read source would have its
      data files spliced and its deletes dropped, so rows deleted at the
-     source come back to life in the target. This tool's "no delete files"
-     claim comes from reading Fivetran's Managed Data Lake writer
-     (ManagedDataLakeWriter.java), which is copy-on-write only. That is a
-     statement about MDLS. If your destination is a customer-managed Glue
-     catalog, or anything else, it has not been established for you.
+     source come back to life in the target.
+
+     For Fivetran sources this is established, and -- usefully -- it does
+     NOT depend on which catalog you use. `CatalogWriter` is an interface
+     whose whole surface is catalog-pointer management (registerTable /
+     updateTableMetadata with a metadata location); GlueCatalogWriter never
+     touches a data file or manifest, and ManagedDataLakeWriter owns a
+     CatalogWriter rather than the reverse. The same writer produces the
+     files whether you register them in Polaris, Glue, Unity or several at
+     once, and it has zero merge-on-read call sites and six copy-on-write
+     ones. See docs/HOW_IT_WORKS.md.
+
+     The check stays anyway: it costs nothing, it covers sources this tool
+     was never aimed at, and it would catch that guarantee changing
+     upstream.
 
   3. FIELD-ID AGREEMENT ACROSS SOURCES. Where sources disagree, each
      divergent source is rewritten in full rather than spliced -- correct,
@@ -162,8 +172,9 @@ def main():
     if not ok_deletes:
         print("    ^^ DO NOT CONSOLIDATE. The splice copies data files and ignores deletes,")
         print("       so rows deleted at the source would come back to life in the target.")
-        print("       This tool has only ever been established against a copy-on-write")
-        print("       writer (Fivetran MDLS); your destination is not that.")
+        print("       Unexpected for a Fivetran-written source -- that writer is")
+        print("       copy-on-write only, whichever catalog it registers into. Worth")
+        print("       reporting before going further; see docs/HOW_IT_WORKS.md.")
 
     print("\n" + "=" * 70)
     print("FIELD-ID AGREEMENT (this decides whether consolidation is CHEAP)")
