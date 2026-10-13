@@ -64,6 +64,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pyarrow as pa
 import yaml
 from dotenv import load_dotenv
+from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.manifest import DataFile, DataFileContent
 from pyiceberg.schema import Schema
@@ -86,6 +87,35 @@ _AMBIENT_AWS_VARS = (
 )
 
 
+def catalog_backend() -> str:
+    """Which catalog this run talks to: 'polaris' (default) or 'glue'.
+
+    This is the ONLY axis on which the two supported deployments differ.
+    Everything downstream of a loaded table -- the reserve/splice/drift/
+    collision/orphan logic, all of register_table() -- operates on pyiceberg
+    Table/Schema/Transaction objects and is catalog-agnostic, because
+    GlueCatalog and RestCatalog both implement the same abstract Catalog
+    interface.
+
+    This indirection exists because the alternative was tried and failed.
+    examples/aws-glue/ used to be a full FORK of this file with only
+    catalog_properties()/_make_catalog() changed -- and its header said so,
+    claiming everything else was "copied verbatim, unmodified, from the
+    validated Polaris version." That was true the day it was written. Then
+    this file received the field-id correctness fixes (e1650c1's
+    name-comparison in file_has_drift_beyond(), find_field_id_disagreements(),
+    the one-scan rewrite, spliced_by_source orphan filtering, the atomic
+    schema+data commit) and the fork received none of them. A customer ran
+    the fork against a 6-tenant Glue catalog and got exactly the silent
+    cross-tenant field-id corruption those fixes exist to prevent. See
+    CHANGELOG.md.
+
+    So: one implementation, one switch. A backend must never again be a copy
+    of this file.
+    """
+    return os.environ.get("CATALOG_BACKEND", "polaris").strip().lower()
+
+
 def purge_ambient_aws_credentials() -> list[str]:
     """Clear ambient AWS credentials/profile out of this process's
     environment before pyiceberg or pyarrow ever look at it, and return the
@@ -99,6 +129,12 @@ def purge_ambient_aws_credentials() -> list[str]:
     failure mode surfaces as a loud, immediate auth error instead of quietly
     reading (or writing) through whatever ambient AWS identity happens to be
     sitting in the environment the script runs in.
+
+    This applies to the Polaris backend ONLY. Glue has no credential vending
+    at all -- pyiceberg's GlueCatalog builds a boto3 Session straight from
+    the ambient environment (env vars, shared profile, or an attached
+    instance role), so purging there would break the one credential path
+    Glue has. catalog_backend() gates every call to this.
     """
     return [var for var in _AMBIENT_AWS_VARS if os.environ.pop(var, None) is not None]
 
@@ -108,7 +144,14 @@ def purge_ambient_aws_credentials() -> list[str]:
 # main(), and the Lambda runtime injects the execution role's credentials
 # into the environment -- so import time is the only point that covers that
 # entry path. main() purges a second time, after .env is read; see there.
-purge_ambient_aws_credentials()
+#
+# CATALOG_BACKEND has to be a REAL environment variable to be seen here --
+# setting it in .env is too late, because load_dotenv() doesn't run until
+# main(). examples/aws-glue/register_consolidation_glue.py sets it in code
+# before importing this module, which is why that adapter exists as a tiny
+# wrapper rather than just documenting an export. main() detects and warns
+# about the too-late case; see _PURGED_AT_IMPORT there.
+_PURGED_AT_IMPORT = purge_ambient_aws_credentials() if catalog_backend() != "glue" else []
 
 # The consolidated table's own bookkeeping column (config: source_id_column)
 # is deliberately assigned a field id from this permanently out-of-band
@@ -166,7 +209,7 @@ def load_config(path: str) -> dict:
     return cfg
 
 
-def resolve_source_namespaces(cat: "RestCatalog", cfg: dict) -> list:
+def resolve_source_namespaces(cat: "Catalog", cfg: dict) -> list:
     """Return the concrete list of source namespaces to consolidate.
 
     If cfg['source_namespaces'] is set, that explicit list is used as-is
@@ -249,6 +292,56 @@ def token_uri_for(catalog_uri: str) -> str:
     return f"{catalog_uri.rstrip('/')}/v1/oauth/tokens"
 
 
+def glue_catalog_properties() -> dict:
+    """Build the GlueCatalog property dict for a customer-managed AWS Glue
+    Data Catalog.
+
+    No OAuth handshake and no vended credentials: pyiceberg's GlueCatalog
+    builds a boto3 Session directly from these properties (GlueCatalog
+    .__init__ constructs boto3.Session(profile_name=..., region_name=...,
+    aws_access_key_id=..., aws_secret_access_key=..., aws_session_token=...)
+    and falls back to boto3's own default credential chain -- env vars,
+    shared config/profile, or an attached instance role -- for anything left
+    unset here).
+
+    GLUE_WAREHOUSE_PATH is the S3 path new tables get created under (e.g.
+    s3://your-bucket/warehouse/) -- required by pyiceberg's base Catalog
+    class the same way 'warehouse' is for Polaris, just pointing at your own
+    bucket instead of one Polaris manages.
+
+    GLUE_CATALOG_ID is optional and only needed for cross-account Glue
+    catalogs (AWS's "Glue Catalog ID," typically a 12-digit account id, when
+    the catalog you're registering into isn't in the same AWS account this
+    script's credentials belong to).
+
+    IAM footprint is necessarily BROADER than the Polaris path's, because
+    there's no per-table credential vending to scope it down: the principal
+    needs Glue read across every source database (glue:GetDatabase,
+    glue:GetTable, glue:GetTables, glue:GetPartitions) plus create/alter on
+    the target (glue:CreateDatabase, glue:CreateTable, glue:UpdateTable),
+    and S3 read across every source table's location plus read+write on the
+    target's. Worth sizing deliberately with whoever owns IAM policy -- see
+    examples/aws-glue/README.md.
+    """
+    props = {"warehouse": _require_env("GLUE_WAREHOUSE_PATH")}
+    # Only set what's actually present -- omitting these entirely (the common
+    # case: running from something that already has an IAM role, e.g.
+    # EC2/ECS/Lambda/CodeBuild) lets boto3's own default credential chain do
+    # the right thing without this script needing to know how.
+    for env_name, prop_name in (
+        ("AWS_REGION", "region_name"),
+        ("AWS_PROFILE", "profile_name"),
+        ("AWS_ACCESS_KEY_ID", "aws_access_key_id"),
+        ("AWS_SECRET_ACCESS_KEY", "aws_secret_access_key"),
+        ("AWS_SESSION_TOKEN", "aws_session_token"),
+        ("GLUE_CATALOG_ID", "glue.id"),
+    ):
+        val = os.environ.get(env_name)
+        if val:
+            props[prop_name] = val
+    return props
+
+
 def catalog_properties() -> dict:
     """Build the RestCatalog property dict for Polaris OAuth
     client-credentials auth.
@@ -273,20 +366,37 @@ def catalog_properties() -> dict:
     }
 
 
-def _make_catalog() -> RestCatalog:
-    return RestCatalog("fivetran_mdls", **catalog_properties())
+def _make_catalog() -> Catalog:
+    """The one place the two backends diverge. Everything that consumes a
+    catalog from here on is written against the abstract Catalog interface,
+    so neither backend needs its own copy of anything below this line."""
+    backend = catalog_backend()
+    if backend == "glue":
+        # Imported lazily so the Polaris path doesn't need boto3 installed
+        # just to start up -- pyiceberg only pulls boto3 in under its 'glue'
+        # extra, and the default deployment of this tool is Polaris.
+        from pyiceberg.catalog.glue import GlueCatalog
+
+        return GlueCatalog("fivetran_mdls_glue", **glue_catalog_properties())
+    if backend == "polaris":
+        return RestCatalog("fivetran_mdls", **catalog_properties())
+    raise SystemExit(
+        f"Unknown CATALOG_BACKEND={backend!r}. Supported values: 'polaris' (default, "
+        "Fivetran-managed MDLS) or 'glue' (customer-managed AWS Glue Data Catalog)."
+    )
 
 
-def get_catalog() -> RestCatalog:
+def get_catalog() -> Catalog:
     """Serial-path catalog instance, used by the top-level driver and by
     anything running outside a worker thread."""
     return _make_catalog()
 
 
-def thread_catalog() -> RestCatalog:
-    """One RestCatalog per worker thread, created lazily on first use in that
+def thread_catalog() -> Catalog:
+    """One catalog per worker thread, created lazily on first use in that
     thread and reused for the rest of that thread's work -- never shared
-    across threads. pyiceberg's RestCatalog isn't documented as thread-safe,
+    across threads. Neither pyiceberg's RestCatalog nor its GlueCatalog is
+    documented as thread-safe,
     and a per-thread catalog instance sidesteps that question entirely
     rather than relying on undocumented behavior holding up under
     concurrent load. The one-time OAuth handshake cost of an extra catalog
@@ -304,7 +414,7 @@ def thread_catalog() -> RestCatalog:
 # --------------------------------------------------------------------------
 
 
-def discover_common_tables(cat: RestCatalog, source_namespaces: list) -> list:
+def discover_common_tables(cat: Catalog, source_namespaces: list) -> list:
     """Auto-discover which table names exist in EVERY listed source
     namespace, so the customer never has to hand-enumerate tables.
 
@@ -339,7 +449,7 @@ def discover_common_tables(cat: RestCatalog, source_namespaces: list) -> list:
     return sorted(common)
 
 
-def ensure_namespace(cat: RestCatalog, ns: str) -> None:
+def ensure_namespace(cat: Catalog, ns: str) -> None:
     try:
         cat.create_namespace(ns)
     except Exception as e:
@@ -360,7 +470,7 @@ def ensure_namespace(cat: RestCatalog, ns: str) -> None:
 # --------------------------------------------------------------------------
 
 
-def create_target_table(cat: RestCatalog, target_id: str, source_schema: Schema, source_id_column: str):
+def create_target_table(cat: Catalog, target_id: str, source_schema: Schema, source_id_column: str):
     """Create the target table, then reserve a permanently out-of-band field
     id for the bookkeeping source-id column in a SEPARATE schema-evolution
     call made after the table exists.
@@ -1159,7 +1269,11 @@ def run(cfg: dict, tables: list = None) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="No-rewrite Iceberg table consolidation for a Fivetran-managed Polaris/MDLS catalog."
+        description=(
+            "No-rewrite Iceberg table consolidation. Targets a Fivetran-managed "
+            "Polaris/MDLS catalog by default, or a customer-managed AWS Glue Data "
+            "Catalog with CATALOG_BACKEND=glue (see examples/aws-glue/)."
+        )
     )
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml (default: ./config.yaml)")
     parser.add_argument(
@@ -1171,20 +1285,39 @@ def main():
 
     load_dotenv()  # loads .env into the process environment if present
 
-    # .env is read here, long after the import-time purge above, so a .env
-    # that sets AWS credentials would reintroduce exactly what that purge
-    # exists to prevent (python-dotenv won't overwrite a variable that is
-    # already set, but the purge just removed them, so it does set them).
-    # Purge again, and say so out loud rather than ignoring them silently --
-    # a .env with AWS keys in it means someone expected them to be used.
-    if reintroduced := purge_ambient_aws_credentials():
-        logger.warning(
-            "Ignoring AWS credential variables found in .env: %s. This tool runs on "
-            "Polaris-vended credentials only and never uses static AWS keys -- see "
-            ".env.example. (The AWS Glue example is the exception, and reads its own "
-            "examples/aws-glue/.env.)",
-            ", ".join(reintroduced),
-        )
+    backend = catalog_backend()
+    if backend == "glue":
+        # The Glue backend RUNS on ambient AWS credentials -- never purge here.
+        # But if CATALOG_BACKEND only became visible via .env, the import-time
+        # purge already fired before anything could know that, and boto3's
+        # credential chain has been quietly stripped. Fail loudly instead of
+        # letting it surface later as an opaque S3/Glue auth error.
+        if _PURGED_AT_IMPORT:
+            raise SystemExit(
+                "CATALOG_BACKEND=glue was set too late (in .env), after this module's "
+                f"import-time credential purge had already removed: {', '.join(_PURGED_AT_IMPORT)}. "
+                "Export it as a real environment variable before the process starts "
+                "(`export CATALOG_BACKEND=glue`), or run the adapter at "
+                "examples/aws-glue/register_consolidation_glue.py, which sets it in code "
+                "before importing this module."
+            )
+        logger.info("Catalog backend: AWS Glue Data Catalog (ambient AWS credentials).")
+    else:
+        # .env is read here, long after the import-time purge above, so a .env
+        # that sets AWS credentials would reintroduce exactly what that purge
+        # exists to prevent (python-dotenv won't overwrite a variable that is
+        # already set, but the purge just removed them, so it does set them).
+        # Purge again, and say so out loud rather than ignoring them silently --
+        # a .env with AWS keys in it means someone expected them to be used.
+        if reintroduced := purge_ambient_aws_credentials():
+            logger.warning(
+                "Ignoring AWS credential variables found in .env: %s. On the Polaris "
+                "backend this tool runs on vended credentials only and never uses static "
+                "AWS keys -- see .env.example. (If you meant to target AWS Glue, set "
+                "CATALOG_BACKEND=glue as a real environment variable, or run "
+                "examples/aws-glue/register_consolidation_glue.py.)",
+                ", ".join(reintroduced),
+            )
 
     cfg = load_config(args.config)
     summary = run(cfg, tables=args.tables or None)

@@ -4,6 +4,134 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Fixed: the AWS Glue example was a stale fork, and it corrupted a customer's data
+
+A customer consolidating six per-tenant SQL Server replications into a
+customer-managed AWS Glue Data Catalog got a target `account` table that
+returned the **wrong column's values**, surfacing as a Snowflake error
+reading a 6-byte string as a `BOOLEAN` bound. The run reported success with
+**0 rewrites**.
+
+**Root cause: `examples/aws-glue/register_consolidation_glue.py` was a
+fork.** It was an 839-line copy of `scripts/register_consolidation.py` with
+only `catalog_properties()`/`_make_catalog()` changed, and its header said
+so -- everything else "copied verbatim, unmodified, from the validated
+Polaris version." True when written. The main script then received the
+field-id correctness fixes and the fork received **none** of them:
+
+| Fix | Main script | Fork |
+|---|---|---|
+| `file_has_drift_beyond()` name comparison (`e1650c1`) | yes | **no** |
+| `find_field_id_disagreements()` pre-flight | yes | **no** |
+| One-scan rewrite (the per-drifted-file duplication bug) | yes | **no** |
+| `spliced_by_source` orphan filter | yes | **no** |
+| `column_already_exists` / atomic schema+data commit | yes | **no** |
+
+The fork's detector was the pre-`e1650c1` signature --
+`file_has_drift_beyond(f, known_field_ids: set)`, taking a bare set of ids
+with no `src_schema` and no name comparison. It only ever flagged an id the
+target did not know *at all*. Since the target is seeded from
+`source_namespaces[0]`, every id another tenant reused for a different
+column was already "known," nothing was flagged, and the files were spliced
+in by reference with their embedded ids disagreeing with the target schema.
+
+This is the **same failure reported 2026-09-22** and documented below as
+"already fixed, but expensive and unsignposted" -- reaching a second
+customer through a copy of the code that predated the fix.
+
+**The fix is structural, not another port.** Hand-porting five fixes into a
+fork is how this happened; doing it again would only reset the clock. The
+Glue backend is now a switch inside the one validated implementation:
+
+- `CATALOG_BACKEND=polaris` (default) or `glue`, read by `catalog_backend()`.
+- `_make_catalog()` is the single branch point; `glue_catalog_properties()`
+  sits beside the Polaris `catalog_properties()`. `GlueCatalog` is imported
+  lazily so the Polaris path needs no boto3.
+- Every signature that hard-coded `RestCatalog` now takes the abstract
+  `Catalog` -- `resolve_source_namespaces`, `discover_common_tables`,
+  `ensure_namespace`, `create_target_table`, `get_catalog`,
+  `thread_catalog`.
+- `examples/aws-glue/register_consolidation_glue.py` is now a ~90-line
+  adapter that sets the variable and calls `rc.main()`, holding no
+  consolidation logic. Verified by AST against the live module that all five
+  fixes are reachable on the Glue path, including **zero** executable
+  `for`-loops over `to_rewrite`.
+
+**Credential handling is the one genuine asymmetry, and it is ordering-
+sensitive.** The Polaris path purges ambient AWS credentials *at import*, to
+force the vended-only path. Glue vends nothing, so those ambient credentials
+are the only ones it has, and that purge must not fire. `CATALOG_BACKEND`
+therefore has to be a real environment variable: setting it in `.env` is too
+late, because `load_dotenv()` doesn't run until `main()`. That is why the
+adapter sets it in code before importing, and why `main()` now detects the
+set-too-late case and exits with an explicit message rather than letting it
+surface later as an opaque S3/Glue auth error.
+
+Verified: Glue constructs a real `GlueCatalog` with credentials intact and
+`glue.id` passed through; Polaris still purges (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`) and reaches its OAuth endpoint; an unknown backend
+exits with a named error; the adapter inherits the full CLI; the
+set-too-late guard fires.
+
+**Three more latent copies of the same mistake, found while fixing this.**
+`verify_consolidation.py`, `bench_vs_union.py` and `generate_delta_log.py`
+each had their own local `RestCatalog("...", **catalog_properties())`
+constructor. Every one would have gone on building a *Polaris* catalog no
+matter what `CATALOG_BACKEND` said -- so a Glue user's verification run
+would have failed or, worse, quietly checked a different catalog than the
+one just written to. That matters most for the verifier specifically, since
+its per-source row-count check is the thing most likely to catch a bad
+consolidation. All three now call `get_catalog()`. The only catalog
+constructors left in the repo are the two branches of `_make_catalog()`.
+Confirmed by import matrix: all four scripts load cleanly under both
+backends.
+
+**Still not verified: Glue itself.** Collapsing the fork means Glue inherits
+the Polaris validation history and every future fix, but the backend swap
+has still never been run end to end against a live Glue catalog with real
+tables. The two carried-over assumptions in
+`examples/aws-glue/README.md` -- the reserved-field-id trick and whether
+Glue's `CreateTable` renumbers field ids -- remain open.
+
+### Open, unverified: the rewrite path looks like it drops rows, and double-counts on reruns
+
+Found by reading the code while fixing the Glue fork, **not yet reproduced
+against live data.** Flagging it now because collapsing the fork routes Glue
+users onto this exact path, and the customer above would land on it
+immediately.
+
+When sources' base schemas disagree about a field id, the divergent source's
+files are excluded from splicing entirely (`register_table()` step 3), so
+step 4's append is the **only** way those rows reach the target. That append
+is filtered:
+
+```python
+tab = src_table.scan(row_filter=f"{name} is not null").to_arrow()
+```
+
+Two consequences follow, if this reading is right:
+
+1. **Rows where the drifted column is NULL never land at all.** They are
+   excluded from the splice and then filtered out of the rewrite.
+2. **Reruns duplicate.** The idempotency guard compares `already_rewritten`
+   (rows where `name is not null`) against
+   `expected_rows = sum(f.record_count for f in to_rewrite)` (every row in
+   those files). With any nulls present, `already_rewritten < expected_rows`
+   is permanently true, so the guard never trips and the non-null rows are
+   appended again on every subsequent run.
+
+**Why existing validation could not have caught it.** The two-source
+reproduction used `clicks`/`ctr`, non-null in every row -- so nothing was
+dropped, `already_rewritten == expected_rows` exactly, and run 2 was a clean
+no-op. That is precisely the case where both bugs are invisible. A sparsely
+populated column (the reporting customer's
+`excludeallsecuritiesfromperformance` is a nullable boolean) would hit both
+on the first run.
+
+`verify_consolidation.py`'s per-source row-count check should surface this as
+a mismatch, which makes it the test: run a consolidation where a divergent
+source's drifted column contains nulls, then verify. Not attempted here.
+
 ### Added: Delta Lake support (experimental) -- one set of files, two metadata layers
 
 Databricks customers cannot read the consolidated Iceberg table. They can

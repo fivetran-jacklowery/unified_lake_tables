@@ -47,8 +47,7 @@ from dotenv import load_dotenv
 # re-implementing it, exactly as verify_consolidation.py and
 # bench_vs_union.py do -- so this can never drift from how the rest of the
 # toolkit authenticates or resolves sources.
-from register_consolidation import catalog_properties, load_config
-from pyiceberg.catalog.rest import RestCatalog
+from register_consolidation import get_catalog, load_config
 from pyiceberg.types import (
     BinaryType, BooleanType, DateType, DecimalType, DoubleType, FixedType,
     FloatType, IntegerType, LongType, StringType, TimestampType,
@@ -183,7 +182,9 @@ def main():
 
     load_dotenv()
     cfg = load_config(args.config)
-    cat = RestCatalog("fivetran_mdls_delta", **catalog_properties())
+    # Backend-aware (CATALOG_BACKEND): never rebuild a catalog locally --
+    # see verify_consolidation.py's note and CHANGELOG.md.
+    cat = get_catalog()
 
     target = f"{cfg['target_namespace']}.{args.table}"
     if not cat.table_exists(target):
