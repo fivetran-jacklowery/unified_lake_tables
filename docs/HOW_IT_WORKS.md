@@ -85,7 +85,7 @@ schema-modifying tool is exactly the kind of thing that should stay
 visible rather than being a hidden side effect of a glob matching more
 (or less) than intended.
 
-## The four-step mechanism
+## The mechanism
 
 ### 1. Reserve
 
@@ -173,32 +173,84 @@ a given run, which isn't yet a stable, order-independent rule for a system
 where sources get added or reordered over time. See "What this does NOT yet
 handle.")
 
-### 4. Rewrite (rare, delta-scoped, real cost)
+### 4. Relabel (no data rewritten)
 
-For every collision, the colliding column gets a **fresh, non-colliding**
-field id via a normal `add_column()` call (letting the catalog auto-assign,
-since this path doesn't need a specific reserved value). Then, only the
-**newly-drifted rows** from the colliding source -- not that source's full
-history -- are read via `scan(row_filter=...)`, tagged with the source
-identity column, and appended for real via `target_table.append()`. This is
-the only place actual bytes get rewritten in the whole pipeline, and the
-cost is bounded by the size of the drift, not the size of the table.
+A file whose source disagrees with the target about what a field id means
+can't be spliced: Iceberg would read its columns through the target's
+names. That disagreement comes from two places. One is the collision in
+step 3. The other is far more common: Fivetran assigns field ids in column
+order when it creates a table and doesn't guarantee column order across
+connections, so two connections of the same connector can disagree about
+every id from the start. `find_field_id_disagreements()` reports that case
+before anything is written.
 
-**Confirmed live gap in this step's idempotency check:** right before doing
-the real rewrite, this step checks whether a prior run already handled this
-collision (`already_rewritten = target_table.scan(row_filter=..., ...)`).
-That check reads the *target* table, whose manifest by this point already
-references files spliced in from every source namespace -- and Polaris's
-vended credentials are scoped to the target table's own default storage
-location, not to every namespace whose files that manifest happens to
-reference. Reproduced live: this check can fail with
-`AWS Error ACCESS_DENIED during HeadObject operation` reading a
-cross-namespace file, crashing the run at exactly this point rather than
-completing the collision resolution. The splice path (steps 2-3) is
-unaffected and commits first regardless. See `README.md`'s Troubleshooting
-section and `CHANGELOG.md`'s "Known issue" entry for the full reproduction
-and a confirmed workaround (DuckDB's Iceberg extension reads the same files
-without issue) -- not yet fixed in this script itself.
+The file's data is fine. Only its footer is wrong for the target, and in
+Parquet the field ids live **only** in the footer -- the Thrift-encoded
+`FileMetaData` at the end of the file. Column chunks, page indexes and row
+groups are located by absolute byte offset. So a copy that keeps every byte
+before the footer and replaces the footer with one carrying the target's ids
+(matched by column **name**) is a valid Parquet file with every offset still
+correct:
+
+```
+relabeled copy = source bytes [0, footer_start)   copied verbatim
+               + new footer (target's field ids)  typically 1-2 KB
+               + footer length + "PAR1"
+```
+
+Nothing is decoded or re-encoded. `scripts/parquet_footer.py` holds the
+Thrift codec, which round-trips every footer field it doesn't touch byte for
+byte; that's tested against footers written by Fivetran's own writer.
+
+Before the copies are made, every column a relabeled source has and the
+target lacks is added to the target by name (`register_source_columns()`),
+so a colliding name gets its own fresh id. Types must match the target's or
+be a promotion Iceberg applies on read; for a promoted column the file's
+min/max bounds are dropped from the manifest entry, because they're
+serialized at the narrower width.
+
+**Where copies live, and why that matters.** Each copy goes to
+`<target>/data/<source_id_column>=<source>/relabeled/<digest>-<source file name>`,
+where the digest is of the full source path. That path is a pure function of
+the source file, which gives refresh and idempotency for free:
+
+- a current source file whose copy path isn't registered yet is relabeled;
+- a registered copy whose source file is no longer current was retired by
+  the writer's copy-on-write and is deleted, in the same commit as its
+  replacement;
+- a rerun with nothing new finds every copy already registered and commits
+  nothing.
+
+**How bytes are copied.** Under Polaris, each copy is read through the
+source table's FileIO and written through the target's, so each side uses
+its own vended credential and nothing beyond vended credentials is needed.
+Reads are ranged (8 MiB chunks): a single whole-object read of a
+writer-compacted file failed the AWS SDK's response-checksum validation,
+while ranged reads, which are how Iceberg readers always read, succeed.
+Under Glue, whose ambient IAM identity can already read the sources and
+write the target, the prefix is an S3 `UploadPartCopy` done inside S3 and
+only the new footer is uploaded. S3 requires every multipart part but the
+last to be at least 5 MiB, so smaller files are downloaded and re-uploaded.
+
+**What this replaced.** Earlier versions rewrote these files physically:
+scan the drifted files, append them as new Parquet. That cost compute and
+memory in proportion to the data. Its output files had no tie back to the
+source files they came from, so its idempotency rested on a row-count guard,
+and a row count cannot see copy-on-write. An UPDATE left the counts equal
+and was skipped, so updated rows stayed stale. A DELETE made the target
+larger than the source and was skipped the same way, so deleted rows stayed.
+Growth made the counts differ, and every drifted file was appended again as
+duplicates. `tests/test_relabel_refresh.py` reproduces all three against the
+old code. Files left by that path are retired automatically on the first run
+of this version and their sources relabeled in their place.
+
+**Self-contained targets.** With `self_contained_target: true`, every
+source's files are relabeled, not only the disagreeing ones, and any spliced
+references already in the target are retired in the same commit. The target
+then references nothing outside its own location, which is what lets an
+engine read it under the target's own vended credential (see "Credentials"
+below). Verified live: Snowflake read such a target through a
+vended-credential catalog integration with no widened storage location.
 
 ### 5. Retire orphaned files (copy-on-write cleanup)
 
@@ -422,11 +474,10 @@ three different code paths:
   this technique had no such check and silently doubled every row on a
   second run -- this was caught empirically (a rerun came back with every
   source's row count exactly 2x) before this check existed.
-- **Rewrite path**: physical appends produce new file paths every time, so
-  path-based deduplication doesn't apply. Instead, before rewriting,
-  `register_table()` checks whether the target already has at least as many
-  non-null rows for that (source, field) pair as the drifted file set would
-  produce, and skips if so.
+- **Relabel path**: every relabeled copy has a deterministic path derived
+  from its source file (see step 4), so the same path check applies: a copy
+  already registered is not made again, and a copy whose source file is gone
+  is retired.
 - **Retirement path** (see step 5 above): an orphan is, by construction,
   only detected once -- the moment it's retired via `delete_data_file()`, it
   stops existing in the target's manifest, so a second run simply won't
@@ -464,6 +515,14 @@ and registers tables. The distinction is invisible until it bites: a
 read-only pair authenticates and lists tables perfectly well, so
 `verify_consolidation.py` succeeds and `register_consolidation.py` fails at
 its first write.
+
+**Relabeled copies (step 4) need nothing more.** Each copy is read with the
+source table's vended credential and written with the target's, both
+obtained by loading the table. And because a vended credential covers only
+the table being read, a target that still splices files by reference is
+unreadable under vending unless its namespace was created with a broader
+location; `self_contained_target: true` avoids that by keeping every file
+under the target's own location.
 
 Confirmed by reading pyiceberg 0.11.1's own source
 (`pyiceberg/catalog/rest/__init__.py`): `RestCatalog` sends the
@@ -534,7 +593,11 @@ See the README's "What this does NOT yet handle" section for the customer-facing
 version. In short: "a source adds a new nullable column" (steps 1-4) and "a
 source performs a row-level INSERT, UPDATE, or DELETE, all handled via
 copy-on-write retirement" (step 5) have all been validated against real
-infrastructure, across two independent sync cycles, on two sources. Note
+infrastructure, across two independent sync cycles, on two sources.
+Relabeling (step 4) was validated against four sources with shuffled column
+orders, across an initial load and two copy-on-write sync cycles, in both
+the default and self-contained modes: every column of every row matched its
+source, and reruns committed nothing. Note
 that on Fivetran's Managed Data Lake destination specifically, DELETE turned
 out to be a soft-delete (a `_fivetran_deleted` flag flip via the same COW
 rewrite as an UPDATE, row physically retained) rather than a true

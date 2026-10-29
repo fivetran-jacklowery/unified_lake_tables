@@ -36,9 +36,10 @@ with pyiceberg and reads them with pyiceberg will always agree with itself.
      was never aimed at, and it would catch that expectation changing.
 
   3. FIELD-ID AGREEMENT ACROSS SOURCES. Where sources disagree, each
-     divergent source is rewritten in full rather than spliced -- correct,
-     but it forfeits the no-rewrite premise that is the point of the tool.
-     Better to know the fraction up front than to discover it from a bill.
+     divergent source's files are relabeled rather than spliced: copied
+     with a corrected Parquet footer. No data is decoded or rewritten, but
+     the copies take storage, and a copy is refreshed whenever the writer
+     replaces its source file. Better to know the fraction up front.
 
 (3) also answers the question worth settling before any large rollout: of N
 tables, how many actually have agreeing ids and can be consolidated cheaply?
@@ -205,23 +206,23 @@ def main():
     print(f"  tables whose sources fully agree   : {len(clean_tables)}/{n}"
           f" ({100*len(clean_tables)/n:.0f}%)  <- spliceable, no rewrite")
     print(f"  tables with any disagreement       : {len(divergent_tables)}/{n}"
-          f" ({100*len(divergent_tables)/n:.0f}%)  <- divergent sources rewritten in full")
+          f" ({100*len(divergent_tables)/n:.0f}%)  <- divergent sources relabeled (copied)")
     if divergent_tables:
         worst = sorted(divergent_tables, key=lambda x: -x[1])[:5]
         print("  worst: " + ", ".join(f"{t} ({c} ids)" for t, c in worst))
     print("\n" + "=" * 70)
     print("DISTINCT FIELD-ID LAYOUTS (this decides how much is salvageable)")
     print("=" * 70)
-    print("  A target table can only splice sources that already agree on field ids --")
+    print("  A target table can only SPLICE sources that agree with it on field ids --")
     print("  Iceberg resolves by id and a manifest entry cannot record a per-file id")
-    print("  mapping. But sources that agree with EACH OTHER can share a target. Group")
-    print("  by layout, consolidate within each group at ZERO rewrite cost, and union")
-    print("  the groups: G tables instead of N sources, no data rewritten.\n")
+    print("  mapping. Every other source is relabeled: copied with a corrected footer.")
+    print("  To avoid even the copies, group sources by layout, consolidate within each")
+    print("  group, and union the groups: G tables instead of N sources, nothing copied.\n")
     n_src = len(sources)
     for g in sorted(group_hist):
-        verdict = ("1 target, nothing rewritten" if g == 1
+        verdict = ("1 target, nothing copied" if g == 1
                    else "grouping buys nothing" if g >= n_src
-                   else f"{g} targets, nothing rewritten")
+                   else f"{g} targets, nothing copied")
         print(f"  {group_hist[g]:5} table(s) need {g} target(s)  -- {verdict}")
     if tables:
         avg = groups_total / len(tables)

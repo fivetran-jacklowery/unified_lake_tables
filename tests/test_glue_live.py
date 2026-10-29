@@ -171,8 +171,8 @@ try:
            "table_workers": 1, "source_workers": 1}
     r1 = rc.run(cfg, tables=["widgets"])
     r2 = rc.run(cfg, tables=["widgets"])
-    print(f"  run 1: spliced={r1['total_spliced']} rewritten={r1['total_rewritten']}")
-    print(f"  run 2: spliced={r2['total_spliced']} rewritten={r2['total_rewritten']}")
+    print(f"  run 1: spliced={r1['total_spliced']} relabeled={r1['total_relabeled']}")
+    print(f"  run 2: spliced={r2['total_spliced']} relabeled={r2['total_relabeled']}")
 
     tgt = cat.load_table(f"{DB_T}.widgets")
     tgt_ids = {f.name: f.field_id for f in tgt.schema().fields}
@@ -186,7 +186,7 @@ try:
     print(f"  rows={got.num_rows} per-source={per_src}")
 
     check("no row loss", got.num_rows == 2 * N, f"{got.num_rows} != {2 * N}")
-    check("no rerun duplication", r2["total_spliced"] == 0 and r2["total_rewritten"] == 0)
+    check("no rerun duplication", r2["total_spliced"] == 0 and r2["total_relabeled"] == 0)
     check("NULLs preserved", got.column("status").null_count == EXPECTED_NULLS,
           f"{got.column('status').null_count} != {EXPECTED_NULLS}")
 

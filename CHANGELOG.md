@@ -4,6 +4,93 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Changed: divergent sources are relabeled, not rewritten -- and refresh now tracks copy-on-write
+
+**The problem.** Fivetran assigns field ids in column order when it creates
+a table, and does not guarantee column order across connections. In a
+multi-tenant deployment, nearly every tenant can end up with its own
+field-id layout for the same table. Every such source went down the
+collision-rewrite path, which read and re-encoded every row. That cost
+compute and memory in proportion to the data, and the largest tables ran out
+of memory on modest workers.
+
+**A correctness bug on that path, too.** Rewritten files had no tie back to
+the source files they came from, so whether a rewrite had already happened
+was decided by comparing row counts (`target rows for this source >= source
+rows` -> skip). A row count cannot see copy-on-write:
+
+| Source change between runs | Old behaviour |
+|---|---|
+| UPDATE (row count unchanged) | skipped -- **target kept the stale values** |
+| DELETE (target now larger) | skipped -- **deleted rows kept** |
+| growth (counts differ) | every drifted file appended again -- **duplicates** |
+
+`test_collision_rewrite.py` never changed a source between runs, so none of
+this showed. The new `tests/test_relabel_refresh.py` reproduces all three
+against the old code and passes against the new.
+
+**The fix: relabel the footer, don't rewrite the data.** A Parquet file's
+field ids live only in its footer; data pages are located by byte offset. So
+a divergent source's file is now copied verbatim up to the footer, followed
+by a new footer carrying the target's ids for the same column names
+(`scripts/parquet_footer.py`). Nothing is decoded or re-encoded. Each copy's
+path is derived from its source file's path, so refresh is the same set
+comparison the splice path already used: copy what's new, retire copies
+whose source file was replaced, in one commit. A rerun with nothing new
+commits nothing.
+
+- **Copy mechanism.** Under Polaris, read with the source's vended
+  credential and write with the target's, so no new permissions are needed
+  and the Lambda example still needs no S3 grants. Under Glue, an S3
+  server-side `UploadPartCopy` of everything before the footer, uploading
+  only the footer (set `RELABEL_SERVER_SIDE_COPY=false` to opt out).
+- **One commit.** Splices, relabeled copies and every retirement now land in
+  a single snapshot per table, where splices and the rewrite used to commit
+  separately.
+- **Automatic migration.** Files left by the old rewrite path are retired on
+  the first run, in the same commit that relabels their source's files. No
+  manual cleanup is needed.
+- **Type promotions.** A source column the target reads at a wider type (int
+  read as long) is relabeled with its min/max bounds dropped from the
+  manifest entry, since they're serialized at the narrower width.
+- **New option, `self_contained_target`** (default `false`;
+  `SELF_CONTAINED_TARGET` for Lambda). Relabels every source, not only the
+  divergent ones, so the target references nothing outside its own location
+  and can be read under its own vended credential. Costs a copy of every
+  file.
+- **Renamed in the run summary:** `total_rewritten` is now
+  `total_relabeled`.
+- `examples/aws-lambda/build.sh` ships `parquet_footer.py`, which
+  `register_consolidation.py` now imports at module level.
+
+**A read gotcha found on the way.** Reading a ~21 MiB writer-compacted
+file with one whole-object read failed the AWS SDK's response-checksum
+validation (`Response checksums mismatch`). Ranged reads of the same object,
+which is how Iceberg readers always read, succeed, so copies read in 8 MiB
+chunks.
+
+**Verified live** against four Connector SDK sources landing the same two
+tables with shuffled column orders, so every field id after the primary key
+disagreed (505,000-510,050 rows per source):
+
+- Initial load, then two sync cycles of updates, soft deletes and inserts,
+  each replacing every source file through copy-on-write. After each,
+  every column of every row matched its source, NULLs included, in both the
+  default and self-contained modes. Every rerun committed nothing.
+- A run that failed partway (before the chunked-read fix) left uncommitted
+  copies behind. The next run completed cleanly, with no duplicates.
+- Snowflake read the self-contained target through a vended-credential
+  catalog integration with no widened storage location, and its per-source
+  aggregates matched a fresh read of the source exactly.
+- The S3 server-side copy was verified byte-for-byte on a 20 MiB object:
+  two parts, a 20.56 MB server-side copy and a 1.4 KB footer upload.
+
+**Not covered.** Nested columns and encrypted Parquet stop the run with an
+explicit error. The Glue server-side path has been exercised on S3 directly,
+not yet end to end through a Glue catalog. Relabeled copies take storage,
+and the target's own snapshot expiry and orphan-file cleanup are what
+eventually remove retired copies from storage.
+
 ### Fixed: the AWS Glue example was a stale fork, and it corrupted a customer's data
 
 A customer consolidating six per-tenant SQL Server replications into a

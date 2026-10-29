@@ -60,3 +60,18 @@ table_workers: 8
 # checking for new/drifted files. This is the dominant lever once you
 # have more sources than tables.
 source_workers: 8
+
+# --- Optional: self-contained target. Default false. ---
+#
+# By default, files from sources that already agree with the target about
+# field ids are spliced in BY REFERENCE: the target's manifest points at
+# files under each source table's own location. That costs no storage, but
+# a catalog that vends per-table credentials (Polaris does) hands a reader
+# of the target a credential for the target's location only -- so an engine
+# reading through vended credentials can't open the spliced files unless
+# the namespace was created with a broader location.
+#
+# true = copy every source's files into the target (each with a corrected
+# Parquet footer; nothing is decoded or rewritten). The target then reads
+# under its own vended credential alone. Costs a copy of every file.
+self_contained_target: false

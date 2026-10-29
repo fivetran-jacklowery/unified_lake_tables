@@ -4,8 +4,11 @@ against a customer-managed AWS Glue Data Catalog.
 
 This is a thin adapter, NOT a reimplementation. All consolidation logic
 (schema reservation, no-rewrite splicing, drift detection, field-id
-collision resolution, copy-on-write orphan retirement) lives in
-scripts/register_consolidation.py and runs here unchanged.
+collision resolution by footer relabeling, copy-on-write orphan retirement)
+lives in scripts/register_consolidation.py and runs here unchanged. Under this
+backend, relabeled copies use an S3 server-side copy, since the ambient IAM
+identity can read the sources and write the target (see
+_server_side_s3_client() there).
 
 WHY THIS FILE IS NINETY LINES AND NOT EIGHT HUNDRED
 ---------------------------------------------------

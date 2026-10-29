@@ -3,7 +3,7 @@ on a schedule (via EventBridge), instead of as a CLI invocation.
 
 This is a thin adapter, not a reimplementation. All of the actual
 consolidation logic (schema reservation, no-rewrite splicing, drift
-detection, collision-only rewrite) lives in scripts/register_consolidation.py
+detection, footer relabeling) lives in scripts/register_consolidation.py
 and is unchanged here -- see that file and docs/HOW_IT_WORKS.md for the
 mechanism. This handler exists to answer one question: how does a customer
 run that script on a schedule without babysitting a server?
@@ -107,6 +107,7 @@ def build_config_from_env() -> dict:
         "source_id_column": source_id_column,
         "table_workers": int(os.environ.get("TABLE_WORKERS", "8")),
         "source_workers": int(os.environ.get("SOURCE_WORKERS", "8")),
+        "self_contained_target": os.environ.get("SELF_CONTAINED_TARGET", "false").strip().lower() == "true",
     }
 
     if source_namespaces_raw:
