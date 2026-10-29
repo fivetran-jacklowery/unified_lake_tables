@@ -32,10 +32,12 @@ all configured source namespaces, it creates (or reuses) one target table
 per table name in a target namespace, and splices in every source's Parquet
 data files directly via manifest/partition-value injection -- no data is
 read or rewritten for the common case. It also detects the one real
-correctness risk this technique introduces (two independently-evolving
-sources landing a new column on the same internal Iceberg field id with
-different meanings) and resolves it safely, at a real but delta-scoped
-rewrite cost, only when that collision actually happens. It also detects
+correctness risk this technique introduces -- sources that disagree about
+what an internal Iceberg field id means, whether because a new column landed
+on an occupied id or because their tables were created with columns in a
+different order -- and resolves it by RELABELING the affected files: each is
+copied with a corrected Parquet footer (scripts/parquet_footer.py), so
+nothing is decoded or rewritten. It also detects
 and retires files that Fivetran's copy-on-write writer has silently
 replaced at a source since the last run (see
 already_registered_by_source() and the orphan-retirement logic in
@@ -53,26 +55,27 @@ change) is unsupported and may produce incorrect results.
 """
 import argparse
 import fnmatch
+import hashlib
 import itertools
 import logging
 import os
+import posixpath
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import pyarrow as pa
 import yaml
 from dotenv import load_dotenv
 from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.rest import RestCatalog
-from pyiceberg.expressions import AlwaysTrue
-from pyiceberg.io.pyarrow import ArrowScan
 from pyiceberg.exceptions import ResolveError
 from pyiceberg.manifest import DataFile, DataFileContent
 from pyiceberg.schema import Schema, promote
 from pyiceberg.typedef import Record
 from pyiceberg.types import StringType
+
+import parquet_footer
 
 
 logging.basicConfig(
@@ -163,6 +166,10 @@ _PURGED_AT_IMPORT = purge_ambient_aws_credentials() if catalog_backend() != "glu
 # two-step create-then-widen dance rather than being set at creation time.
 RESERVED_FIELD_ID_BASE = 100000
 
+# Relabeled copies (register_table() step 4) live under this directory inside
+# each source's partition directory of the target. See relabeled_path().
+RELABELED_DIR = "relabeled"
+
 _thread_local = threading.local()
 
 
@@ -207,6 +214,7 @@ def load_config(path: str) -> dict:
 
     cfg.setdefault("table_workers", 8)
     cfg.setdefault("source_workers", 8)
+    cfg.setdefault("self_contained_target", False)
     return cfg
 
 
@@ -609,25 +617,32 @@ def already_registered_by_source(target_table) -> dict:
          _OverwriteFiles.delete_data_file() -- that call needs the actual
          DataFile, not its path.
 
-    Returns a (by_source, spliced_by_source) pair. by_source is every
-    registered file, used for the plain "already registered, don't
-    re-splice" idempotency check. spliced_by_source is the subset actually
-    eligible for copy-on-write orphan detection: only files spliced in BY
-    REFERENCE still physically live at the SOURCE's own storage location,
-    so only those can be meaningfully compared against "does this path
-    still appear in the source's current file listing." A file created by
-    the collision-rewrite path (register_table()'s step 4, via
-    Transaction.append()) is a brand-new physical file written under the
-    TARGET's own storage location -- it will never appear in any source's
-    own file listing, by construction, regardless of whether anything is
-    wrong with it. Treating it as orphan-eligible anyway was a real,
-    reproduced bug: every such file got deleted and re-derived on every
-    subsequent run, since "not in the source's current files" was always
-    true for it. See CHANGELOG.md "Fixed: rewrite-path files were
-    perpetually treated as copy-on-write orphans".
+    Returns (by_source, spliced_by_source, relabeled_by_source,
+    legacy_by_source), each {namespace: {path: DataFile}}:
+
+      by_source           every registered file -- the plain "already
+                          registered, don't re-splice" idempotency check.
+      spliced_by_source   files spliced in BY REFERENCE, still living at the
+                          SOURCE's own storage location. Only these can be
+                          compared against "does this path still appear in the
+                          source's current file listing."
+      relabeled_by_source relabeled copies (register_table() step 4), under
+                          the target's location at relabeled_path(). Each maps
+                          back to exactly one source file through that path,
+                          which is how their copy-on-write retirement works.
+      legacy_by_source    anything else under the target's location: files
+                          appended by the physical rewrite path this tool used
+                          before relabeling. They cannot be tied to a source
+                          file, so register_table() retires them and relabels
+                          their source's files instead.
+
+    Treating a target-located file as orphan-eligible against the SOURCE's
+    listing was a real, reproduced bug: it never appears there by
+    construction, so every such file got deleted and re-derived on every run.
+    See CHANGELOG.md "Fixed: rewrite-path files were perpetually treated as
+    copy-on-write orphans".
     """
-    by_source = {}
-    spliced_by_source = {}
+    by_source, spliced, relabeled, legacy = {}, {}, {}, {}
     target_location = target_table.metadata.location
     try:
         for task in target_table.scan().plan_files():
@@ -635,10 +650,118 @@ def already_registered_by_source(target_table) -> dict:
             src = f.partition[0]
             by_source.setdefault(src, {})[f.file_path] = f
             if not f.file_path.startswith(target_location):
-                spliced_by_source.setdefault(src, {})[f.file_path] = f
+                spliced.setdefault(src, {})[f.file_path] = f
+            elif f"/{RELABELED_DIR}/" in f.file_path:
+                relabeled.setdefault(src, {})[f.file_path] = f
+            else:
+                legacy.setdefault(src, {})[f.file_path] = f
     except Exception:
         pass
-    return by_source, spliced_by_source
+    return by_source, spliced, relabeled, legacy
+
+
+def relabeled_path(target_location: str, source_id_column: str, ns: str, source_path: str) -> str:
+    """Where the relabeled copy of one source file lives. Deterministic, so a
+    rerun finds an existing copy instead of making another, and a copy maps
+    back to exactly one source file. The digest of the full source path keeps
+    two source files with the same basename apart."""
+    digest = hashlib.sha1(source_path.encode()).hexdigest()[:16]
+    name = posixpath.basename(source_path)
+    return f"{target_location.rstrip('/')}/data/{source_id_column}={ns}/{RELABELED_DIR}/{digest}-{name}"
+
+
+def register_source_columns(cat, target_table, target_id: str, schemas: list):
+    """Add every column the given source schemas have and the target lacks,
+    matched by NAME, at fresh field ids. Only the missing fields are passed to
+    union_by_name, so a column the target already holds at a wider type (see
+    promote_target_types_to_widest()) is never narrowed back."""
+    for schema in schemas:
+        have = {f.name for f in target_table.schema().fields}
+        missing = [f for f in schema.fields if f.name not in have]
+        if not missing:
+            continue
+        with target_table.update_schema() as us:
+            us.union_by_name(Schema(*missing))
+        target_table = cat.load_table(target_id)
+    return target_table
+
+
+def relabel_id_map(src_schema, target_schema, table_name: str, ns: str) -> tuple:
+    """({source field id: target field id}, {source ids whose type the target
+    promotes}) for one source, matched by column NAME.
+
+    Relabeling cannot convert data, so every source type must either equal
+    the target's or be one Iceberg promotes on read (int -> long, say). The
+    target's types were already widened by promote_target_types_to_widest(),
+    so anything else here is a bug, not a user error.
+    """
+    id_map, promoted = {}, set()
+    for f in src_schema.fields:
+        t = target_schema.find_field(f.name)
+        if t.field_type != f.field_type:
+            try:
+                promote(f.field_type, t.field_type)
+            except ResolveError as e:
+                raise SystemExit(
+                    f"[{table_name}] cannot relabel {ns}.'{f.name}': {f.field_type} does not "
+                    f"promote to the target's {t.field_type}"
+                ) from e
+            promoted.add(f.field_id)
+        id_map[f.field_id] = t.field_id
+    return id_map, promoted
+
+
+def relabeled_data_file(src, dst_path: str, size: int, ns: str, id_map: dict, promoted: set, spec_id: int):
+    """The target's DataFile for a relabeled copy: the source file's metrics,
+    re-keyed from source field ids to target field ids.
+
+    Lower/upper bounds are serialized in the column's own type, so for a
+    column the target reads at a wider type they would be the wrong width (a
+    4-byte int bound under a long column -- the warehouse-rejects-the-bound
+    failure). Those bounds are dropped; counts are kept. Dropping a bound only
+    costs pruning, never correctness."""
+
+    def remap(d, skip=()):
+        return None if d is None else {id_map[k]: v for k, v in d.items() if k in id_map and k not in skip}
+
+    return DataFile.from_args(
+        content=DataFileContent.DATA,
+        file_path=dst_path,
+        file_format=src.file_format,
+        partition=Record(ns),
+        record_count=src.record_count,
+        file_size_in_bytes=size,
+        column_sizes=remap(src.column_sizes),
+        value_counts=remap(src.value_counts),
+        null_value_counts=remap(src.null_value_counts),
+        nan_value_counts=remap(src.nan_value_counts),
+        lower_bounds=remap(src.lower_bounds, promoted),
+        upper_bounds=remap(src.upper_bounds, promoted),
+        split_offsets=src.split_offsets,
+        spec_id=spec_id,
+    )
+
+
+def _server_side_s3_client(workers: int):
+    """A boto3 S3 client for server-side relabel copies, or None to copy
+    through each table's own FileIO instead.
+
+    Server-side copy needs ONE credential that can read the source and write
+    the target. Only the Glue backend has one: its ambient IAM identity is
+    already the only credential it uses. Under Polaris each table's vended
+    credential covers that table alone, and ambient credentials are purged on
+    purpose (see purge_ambient_aws_credentials()), so copies go through
+    FileIO -- source read with the source's credential, target written with
+    the target's. Set RELABEL_SERVER_SIDE_COPY=false to force FileIO on Glue.
+    """
+    if catalog_backend() != "glue":
+        return None
+    if os.environ.get("RELABEL_SERVER_SIDE_COPY", "true").strip().lower() == "false":
+        return None
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client("s3", config=Config(max_pool_connections=max(10, workers * 2)))
 
 
 def _load_source_files(source_namespace: str, table_name: str):
@@ -678,22 +801,21 @@ def find_field_id_disagreements(schemas_by_source: dict) -> list:
 
     As of e1650c1 the tool DOES handle this correctly -- file_has_drift_beyond()
     compares each source's own name for a field id against the target's
-    registered name, so a divergent source is routed through the rewrite
-    path and its data lands right. Verified end to end against two sources
+    registered name, so a divergent source is routed away from the splice
+    (now to the relabel path) and its data lands right. Verified end to end against two sources
     whose columns differ only in declaration order: values correct for
     both, no corruption.
 
-    But it handles it at full price, and says nothing about that. Because a
-    file's field ids are baked into its Parquet footer, the ONLY way to make
-    a divergent source safe is to rewrite it physically -- so that source
-    gets 0 files spliced and 100% of its rows rewritten, silently reported
-    as an ordinary "collision." For base-schema divergence across many
-    sources that is an enormous first run and forfeits the whole no-rewrite
-    premise, and today nothing warns anyone before they start.
+    Because a file's field ids live in its Parquet footer, a divergent
+    source cannot be spliced by reference. Its files are relabeled instead:
+    copied with a footer carrying the target's ids (register_table() step 4,
+    scripts/parquet_footer.py). That decodes nothing, but it is still a copy
+    of every affected file -- for base-schema divergence, 100% of that
+    source -- and it takes storage.
 
     Hence: this is a WARNING, not an abort. The run is correct either way;
-    the point is to say up front which sources will be rewritten wholesale
-    and why, so nobody discovers it from a bill.
+    the point is to say up front which sources will be copied wholesale and
+    why, so nobody discovers it from a storage bill.
 
     Returns a list of (field_id, [(namespace, name, type), ...]) for every
     field id where sources disagree on either the name or the type.
@@ -840,7 +962,7 @@ def register_table(table_name: str, cfg: dict) -> tuple:
 
         # Measure the actual cost rather than assuming it. A contested id that
         # every one of a source's files carries data for means its BASE schema
-        # diverges, so the whole source gets rewritten. A contested id only
+        # diverges, so the whole source gets relabeled. A contested id only
         # recent files carry is ordinary drift, which the collision path
         # already handles cheaply and already logs. Same schema symptom, very
         # different bill -- so report the measured fraction and only escalate
@@ -886,20 +1008,19 @@ def register_table(table_name: str, cfg: dict) -> tuple:
                 lines.append(f"    {ns:<32} {name} ({ftype})")
         lines += [
             "",
-            "The run below is CORRECT -- each divergent source is routed through the",
-            "rewrite path, so its data lands under the right names and types. But a",
-            "file's field ids are baked into its Parquet footer, so rewriting is the",
-            "only way to make it safe. Files to be physically rewritten:",
+            "The run below is CORRECT -- each divergent source's files are relabeled:",
+            "copied with a Parquet footer carrying the target's field ids, so the data",
+            "lands under the right names and types. Nothing is decoded or rewritten,",
+            "but the copies take storage. Files to be relabeled:",
             "",
         ]
         for ns, (hit, total) in sorted(affected.items()):
             lines.append(f"    {ns:<32} {hit}/{total} files ({100 * hit / total:.0f}%)")
         lines += [
             "",
-            "That is a one-time cost per source (later runs are still no-ops), but",
-            "at scale it is a large first run and it forfeits the no-rewrite premise",
-            "for those sources. To keep consolidation cheap, consolidate sources",
-            "whose field-id mapping already agrees. See docs/HOW_IT_WORKS.md.",
+            "Later runs copy only files the writer has replaced since. To avoid the",
+            "copies altogether, consolidate sources whose field-id mapping already",
+            "agrees (scripts/diagnose_sources.py groups them). See docs/HOW_IT_WORKS.md.",
         ]
         logger.warning("\n".join(lines))
 
@@ -937,7 +1058,9 @@ def register_table(table_name: str, cfg: dict) -> tuple:
     # name for it won" -- see file_has_drift_beyond()'s docstring.
     known_field_names = {f.field_id: f.name for f in target_table.schema().fields}
 
-    already_by_source, spliced_by_source = already_registered_by_source(target_table)
+    already_by_source, spliced_by_source, relabeled_by_source, legacy_by_source = already_registered_by_source(
+        target_table
+    )
     already = {p for paths in already_by_source.values() for p in paths}
 
     # 1. Detect every source's drifted files. The per-source (load_table +
@@ -959,8 +1082,8 @@ def register_table(table_name: str, cfg: dict) -> tuple:
 
     # 2. Resolve each drifted field id: first distinct name seen owns the
     #    physical id (no-rewrite widen); any OTHER distinct name sharing
-    #    that same physical id is a genuine collision -> fresh id + real
-    #    rewrite for just its drifted rows.
+    #    that same physical id is a genuine collision -> its files are
+    #    relabeled in step 4 (the name maps to its own target id).
     #
     #    IMPORTANT: "first distinct name seen" only gets to become the
     #    no-rewrite owner if the target doesn't ALREADY have a registered
@@ -978,7 +1101,7 @@ def register_table(table_name: str, cfg: dict) -> tuple:
     #    When the target already has a name for this id, that name is the
     #    true owner outright, and EVERY distinct name seen this run is a
     #    loser needing the rewrite path -- none of them get a free widen.
-    rewrite_needed = []
+    relabel_needed = []
     for field_id, entries in drift_by_field_id.items():
         distinct_names = {}
         for ns, name, ftype in entries:
@@ -1006,10 +1129,10 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         for other_name in losers:
             for ns in distinct_names[other_name]:
                 other_type = next(ft for s, n, ft in entries if n == other_name and s == ns)
-                rewrite_needed.append((ns, field_id, other_name, other_type))
+                relabel_needed.append((ns, field_id, other_name, other_type))
                 logger.warning(
-                    "  [%s] COLLISION at field_id=%d: '%s' already owns it, '%s'.'%s' needs a "
-                    "fresh field id + rewrite",
+                    "  [%s] COLLISION at field_id=%d: '%s' already owns it, '%s'.'%s' is "
+                    "relabeled onto its own target field id",
                     table_name,
                     field_id,
                     owner_name,
@@ -1019,12 +1142,22 @@ def register_table(table_name: str, cfg: dict) -> tuple:
 
     # 3. No-rewrite pass: splice in every file whose drift (if any) resolves
     #    to the id's registered owner name. Files belonging to a source that
-    #    needs a rewrite for this field id are excluded here (handled in
+    #    needs relabeling for this field id are excluded here (handled in
     #    step 4) so we never splice in a file whose embedded field id
     #    doesn't match what we've told the target schema that id means.
-    needs_rewrite_sources_by_field = {}
-    for ns, field_id, name, ftype in rewrite_needed:
-        needs_rewrite_sources_by_field.setdefault(field_id, set()).add(ns)
+    needs_relabel_sources_by_field = {}
+    for ns, field_id, name, ftype in relabel_needed:
+        needs_relabel_sources_by_field.setdefault(field_id, set()).add(ns)
+
+    # self_contained_target: relabel EVERY source's files, not only the ones
+    # that disagree with the target, so the target holds no references to
+    # files under any source's location. A spliced file lives under its
+    # source, and Polaris vends a credential covering only the table being
+    # read -- so a target with spliced files can't be read through the
+    # catalog's vended credentials without widening the namespace location
+    # (see docs/HOW_IT_WORKS.md). The price is a copy of every file.
+    self_contained = bool(cfg.get("self_contained_target"))
+    relabel_by_source = {}  # {ns: {source path: DataFile}} -- step 4's work list
 
     new_files = []
     orphaned_files = []  # DataFile objects to retire: previously spliced in
@@ -1048,15 +1181,19 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         # copy-on-write orphans".
         registered_this_source = spliced_by_source.get(ns, {})
 
-        files_ok, rows_this_source, files_skipped_already, files_skipped_rewrite = 0, 0, 0, 0
+        files_ok, rows_this_source, files_skipped_already, files_skipped_relabel = 0, 0, 0, 0
         for task in files:
             f = task.file
+            if self_contained:
+                relabel_by_source.setdefault(ns, {})[f.file_path] = f
+                files_skipped_relabel += 1
+                continue
             if f.file_path in already:
                 files_skipped_already += 1
                 continue
             drift_field = file_has_drift_beyond(f, known_field_names, src_schema)
-            if drift_field is not None and ns in needs_rewrite_sources_by_field.get(drift_field, set()):
-                files_skipped_rewrite += 1
+            if drift_field is not None and ns in needs_relabel_sources_by_field.get(drift_field, set()):
+                files_skipped_relabel += 1
                 continue
             new_file = DataFile.from_args(
                 content=DataFileContent.DATA,
@@ -1084,8 +1221,11 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         # be retired here too -- otherwise its rows sit stale in the target
         # forever, duplicated against whatever replacement file(s) just got
         # spliced in above.
+        # Under self_contained_target every spliced reference is retired:
+        # its relabeled copy replaces it in this same commit.
         orphaned_this_source = [
-            df for path, df in registered_this_source.items() if path not in current_paths_this_source
+            df for path, df in registered_this_source.items()
+            if self_contained or path not in current_paths_this_source
         ]
         orphaned_rows_this_source = sum(df.record_count for df in orphaned_this_source)
         orphaned_files.extend(orphaned_this_source)
@@ -1094,244 +1234,154 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         note = []
         if files_skipped_already:
             note.append(f"{files_skipped_already} already registered")
-        if files_skipped_rewrite:
-            note.append(f"{files_skipped_rewrite} pending physical rewrite")
+        if files_skipped_relabel:
+            note.append(f"{files_skipped_relabel} to be relabeled")
         if orphaned_this_source:
             note.append(f"{len(orphaned_this_source)} orphaned file(s) retired ({orphaned_rows_this_source} stale rows)")
         flag = f" ({', '.join(note)})" if note else ""
         logger.info("  [%s] %s: %d file(s) spliced in, %d rows%s", table_name, ns, files_ok, rows_this_source, flag)
 
-    if orphaned_files:
-        # A retirement is present -- must commit via an OVERWRITE-type
-        # transaction (delete_data_file() + append_data_file() together, in
-        # the same commit) rather than a pure fast-append. Under the hood
-        # this only rewrites the small Avro MANIFEST file(s) that mixed a
-        # retired entry in with other still-valid ones -- never the
-        # underlying Parquet data files -- so it stays a metadata-only
-        # operation, same as the pure-splice path, just with a bit more
-        # manifest bookkeeping. Only paid when an orphan is actually
-        # detected; every other run (the common case) still uses the
-        # cheaper pure-append path below, unchanged.
+    # 4. Relabel pass: every file routed away from the splice above -- a
+    #    source whose own name for a field id disagrees with the target's --
+    #    gets a RELABELED COPY instead of being rewritten. The copy is the
+    #    source file's bytes verbatim up to the Parquet footer, plus a new
+    #    footer whose field ids are the target's ids for the same column
+    #    NAMES. Nothing is decoded or re-encoded. See scripts/parquet_footer.py.
+    #
+    #    This replaces a physical rewrite (scan the drifted files, append them
+    #    as new Parquet). That path cost compute and memory proportional to the
+    #    data, and -- because its output files had no tie back to the source
+    #    files they came from -- its idempotency rested on a row-count guard
+    #    that could not see copy-on-write: an UPDATE left row counts unchanged
+    #    and was silently skipped (stale values), a DELETE was skipped the same
+    #    way (deleted rows kept), and growth re-appended everything
+    #    (duplicates). See CHANGELOG.md.
+    #
+    #    A relabeled copy has a deterministic path derived from its source
+    #    file's path (relabeled_path()), so refresh is a set comparison exactly
+    #    like the splice path's orphan check: a source file with no copy yet is
+    #    relabeled; a copy whose source file is no longer current was retired
+    #    by the writer's copy-on-write and is deleted here, in the same commit
+    #    as its replacement.
+    for ns, field_id, name, ftype in relabel_needed:
+        src_schema, files = files_by_source[ns]
+        for task in files:
+            if file_has_drift_beyond(task.file, known_field_names, src_schema) == field_id:
+                relabel_by_source.setdefault(ns, {})[task.file.file_path] = task.file
+
+    # Every column a relabeled source has must exist in the target, by name,
+    # before its id map can be built. A colliding name gets a fresh id here.
+    if relabel_by_source:
+        target_table = register_source_columns(
+            cat, target_table, target_id, [files_by_source[ns][0] for ns in relabel_by_source]
+        )
+    target_schema = target_table.schema()
+    target_location = target_table.metadata.location
+    spec_id = target_table.spec().spec_id
+
+    relabel_jobs = []          # (ns, source DataFile, destination path, id map, promoted ids)
+    relabel_orphans = []       # relabeled copies whose source file is gone
+    legacy_retired = []        # files written by the pre-relabel rewrite path
+    for ns in source_namespaces:
+        src_schema, _ = files_by_source[ns]
+        wanted = {
+            relabeled_path(target_location, source_id_column, ns, path): df
+            for path, df in relabel_by_source.get(ns, {}).items()
+        }
+        have = relabeled_by_source.get(ns, {})
+        relabel_orphans.extend(df for path, df in have.items() if path not in wanted)
+
+        # Files appended by the old rewrite path cannot be matched to the
+        # source files they came from, so there is no way to keep them
+        # current. Retire them in the same commit that relabels this source's
+        # files; otherwise their rows would sit alongside the relabeled copies
+        # as duplicates.
+        legacy = list(legacy_by_source.get(ns, {}).values())
+        if legacy:
+            logger.warning(
+                "  [%s] %s: retiring %d file(s) written by the old rewrite path; this source's "
+                "drifted files are relabeled in their place (one-time migration)",
+                table_name, ns, len(legacy),
+            )
+            legacy_retired.extend(legacy)
+
+        if not wanted:
+            continue
+        id_map, promoted = relabel_id_map(src_schema, target_schema, table_name, ns)
+        relabel_jobs.extend(
+            (ns, df, dst, id_map, promoted) for dst, df in wanted.items() if dst not in have
+        )
+
+    relabeled_files = []
+    if relabel_jobs:
+        src_ios = {ns: cat.load_table(f"{ns}.{table_name}").io for ns in {job[0] for job in relabel_jobs}}
+        s3 = _server_side_s3_client(source_workers)
+
+        def _relabel(job):
+            ns, src_df, dst, id_map, promoted = job
+            if s3 is not None and src_df.file_path.startswith("s3://") and dst.startswith("s3://"):
+                size = parquet_footer.relabel_s3_object(s3, src_df.file_path, dst, id_map)
+            else:
+                size = parquet_footer.relabel_via_fileio(src_ios[ns], target_table.io, src_df.file_path, dst, id_map)
+            return relabeled_data_file(src_df, dst, size, ns, id_map, promoted, spec_id)
+
+        with ThreadPoolExecutor(max_workers=source_workers) as ex:
+            relabeled_files = list(ex.map(_relabel, relabel_jobs))
+
+        for ns in sorted({job[0] for job in relabel_jobs}):
+            mine = [df for df in relabeled_files if df.partition[0] == ns]
+            logger.info(
+                "  [%s] %s: %d file(s) relabeled (%d rows, %s), no data rewritten",
+                table_name, ns, len(mine), sum(df.record_count for df in mine),
+                "S3 server-side copy" if s3 is not None else "copied through FileIO",
+            )
+    if relabel_orphans:
+        logger.info(
+            "  [%s] %d relabeled copy(ies) retired: their source files were replaced by copy-on-write",
+            table_name, len(relabel_orphans),
+        )
+
+    # 5. ONE commit for everything: splices, relabeled copies, and every
+    #    retirement. A retirement needs an OVERWRITE-type snapshot
+    #    (delete_data_file() + append_data_file() together), which only
+    #    rewrites the small Avro manifest(s) that mixed a retired entry in with
+    #    still-valid ones -- never Parquet data. With nothing to retire, the
+    #    cheaper fast-append path is used. Either way readers see the whole
+    #    refresh or none of it.
+    to_delete = orphaned_files + relabel_orphans + legacy_retired
+    to_add = new_files + relabeled_files
+    if to_delete:
         with target_table.transaction() as txn:
             with txn.update_snapshot({}).overwrite() as ov:
-                for df in orphaned_files:
+                for df in to_delete:
                     ov.delete_data_file(df)
-                for df in new_files:
+                for df in to_add:
                     ov.append_data_file(df)
         target_table = cat.load_table(target_id)
-    elif new_files:
+    elif to_add:
         with target_table.transaction() as txn:
             with txn._append_snapshot_producer({}) as append_files:
-                for df in new_files:
+                for df in to_add:
                     append_files.append_data_file(df)
         target_table = cat.load_table(target_id)
 
-    # 4. Rewrite pass: for every (source, field_id) needing a fresh id, read
-    #    just the drifted rows, add the fresh column, append for real. This
-    #    is the only place actual bytes get rewritten in this whole
-    #    pipeline, and only for the small sliver of genuinely-colliding new
-    #    data, never the historical bulk.
-    rewritten_rows = 0
-    # Recomputed AFTER step 3's commit, so it reflects what is actually in the
-    # target right now. The guard below counts rows from this rather than
-    # scanning data, which is both exact and free -- see there.
-    already_by_source_now, _ = already_registered_by_source(target_table)
-    for ns, field_id, name, ftype in rewrite_needed:
-        src_schema, files = files_by_source[ns]
-        # Keep the TASKS, not just the DataFiles. The rewrite below reads
-        # exactly these files through ArrowScan, and that needs FileScanTask
-        # objects. to_rewrite is derived from them for the row-count math.
-        to_rewrite_tasks = [
-            task
-            for task in files
-            if task.file.file_path not in already
-            and file_has_drift_beyond(task.file, known_field_names, src_schema) == field_id
-        ]
-        to_rewrite = [task.file for task in to_rewrite_tasks]
-        if not to_rewrite:
-            continue
-
-        src_table = cat.load_table(f"{ns}.{table_name}")
-        column_already_exists = name in {f.name for f in target_table.schema().fields}
-
-        if column_already_exists:
-            # The column is already registered. With the atomic commit below,
-            # that alone would normally be enough to know its data is there
-            # too -- but a run from BEFORE that fix could have left the
-            # column registered with none of this source's data ever
-            # appended (see CHANGELOG.md "Fixed: silent field-id collision
-            # misattribution" and file_has_drift_beyond()'s docstring for
-            # the full mechanism). Check explicitly rather than trusting
-            # "column exists" alone, so a pre-existing broken state gets
-            # healed instead of silently staying broken.
-            #
-            # COUNT LIKE WITH LIKE. This guard used to compare
-            #     target rows WHERE source = ns AND <name> IS NOT NULL
-            # against
-            #     sum(record_count) over the drifted files   (ALL rows)
-            # -- a non-null row count on the left, a total row count on the
-            # right. Any NULL at all in the drifted column made the left side
-            # permanently smaller, so the guard never fired and every rerun
-            # re-appended. Reproduced against multi-source data. See
-            # CHANGELOG.md.
-            #
-            # Both sides are now total row counts for this source, taken from
-            # MANIFEST METADATA rather than by scanning data. That is exact,
-            # free, and it also retires the MultiSourceFileIO/ACCESS_DENIED
-            # dance this block used to need: counting rows meant reading
-            # spliced files that physically live under the SOURCE's storage
-            # location, which the target's vended credential cannot reach.
-            # Summing record_count never opens a data file at all.
-            target_rows_for_ns = sum(
-                df.record_count for df in already_by_source_now.get(ns, {}).values()
-            )
-            source_rows_for_ns = sum(task.file.record_count for task in files)
-            already_rewritten, expected_rows = target_rows_for_ns, source_rows_for_ns
-            if target_rows_for_ns >= source_rows_for_ns:
-                logger.info(
-                    "  [%s] '%s' from %s: %d row(s) already rewritten/appended in a prior run, skipping",
-                    table_name,
-                    name,
-                    ns,
-                    already_rewritten,
-                )
-                continue
-            logger.warning(
-                # Two very different situations reach here, and the message used to
-                # assert the rarer one as fact. Either (a) a prior run was
-                # interrupted before the atomic-commit fix and left the column
-                # registered with no data, or (b) -- far more common -- the column
-                # already exists simply because ANOTHER source contributed it, and
-                # this source's rows for it have legitimately never been written.
-                # Case (b) happens on the very first run whenever sources' base
-                # schemas disagree about a field id (see
-                # find_field_id_disagreements), where blaming "an interrupted run"
-                # sends whoever reads the log hunting a failure that never occurred.
-                "  [%s] '%s' from %s: column exists but only %d/%d expected row(s) present. Either "
-                "another source contributed this column and none of THIS source's rows for it have "
-                "been written yet (normal on a first run when sources' base schemas disagree about a "
-                "field id), or a pre-atomic-commit run was interrupted. Appending the missing rows "
-                "now (schema unchanged, data-only commit).",
-                table_name,
-                name,
-                ns,
-                already_rewritten,
-                expected_rows,
-            )
-
-        # Read EXACTLY the drifted files, every row, NULLs preserved.
-        #
-        # This used to be `src_table.scan(row_filter=f"{name} is not null")`,
-        # and that filter silently dropped rows. For base-schema divergence
-        # the source's files are ALL excluded from splicing above, so this
-        # append is the ONLY path those rows have into the target -- and any
-        # row whose drifted column was NULL was filtered right back out of
-        # it. Reproduced against multi-source data: rows short by exactly the
-        # number of NULLs, with null-free sources losing nothing. See
-        # CHANGELOG.md.
-        #
-        # The fix is NOT simply dropping the filter. A whole-table scan would
-        # be correct for base-schema divergence (where every file is drifted)
-        # but WRONG for ordinary drift, where only recent files carry the new
-        # column: step 3 splices this source's non-drifted files in by
-        # reference, so re-reading the whole table here would append those
-        # rows a second time. That trades a row-loss bug for a row-duplication
-        # bug -- and data where every file drifts would not have shown it.
-        #
-        # So scan the drifted files and nothing else. ArrowScan takes the
-        # FileScanTasks directly, which is also why to_rewrite_tasks is kept
-        # above. Going through ArrowScan rather than reading the Parquet with
-        # pyarrow directly matters: it applies the source's Iceberg schema, so
-        # a file written before some column existed still yields that column
-        # as NULL instead of coming back missing.
-        #
-        # Still ONE scan, not one per file -- this was previously a
-        # `for f in to_rewrite:` loop whose body never referenced `f`, which
-        # re-ran the identical whole-table scan per iteration and appended
-        # every copy (7 drifted files produced an exact 7x row count; see
-        # CHANGELOG.md "Fixed: collision rewrite appended one duplicate copy
-        # per drifted file"). Passing every task to a single to_table() call
-        # keeps that property structurally.
-        tab = ArrowScan(
-            src_table.metadata,
-            src_table.io,
-            src_schema,
-            AlwaysTrue(),
-        ).to_table(to_rewrite_tasks)
-        if tab.num_rows == 0:
-            continue
-        tab = tab.append_column(source_id_column, pa.array([ns] * tab.num_rows, type=pa.string()))
-        tabs = [tab]
-
-        # THE FIX: schema evolution (if the column is new) and every file's
-        # data append for this collision now commit as ONE atomic
-        # Transaction -- either both land together in a single snapshot, or
-        # neither does. Before this, add_column() was its own standalone
-        # commit, followed by a separate append() per file; an interruption
-        # between them left the column registered with no data, AND (see
-        # file_has_drift_beyond()'s docstring) made drift-detection stop
-        # flagging this source's file at all on the next run, since the
-        # field id was already "known" -- reproduced live, see
-        # CHANGELOG.md "Fixed: silent field-id collision misattribution".
-        # union_by_name(), not add_column(name, ftype). The append below
-        # carries this source's ENTIRE column set, not just the one drifted
-        # column -- so every column the source has and the target lacks must
-        # be registered first, or pyiceberg rejects the whole append with
-        #     ValueError: PyArrow table contains more columns: <col>.
-        #     Update the schema first (hint, use union_by_name).
-        # and the run dies with nothing committed for this table.
-        #
-        # add_column() covered only the single colliding column, which is a
-        # subset of what is needed and happens to be sufficient ONLY when the
-        # sources' column sets are identical. They are not, in general:
-        # discover_common_tables() intersects table NAMES, never column
-        # names, so a tenant whose connector is newer or whose source gained
-        # a column legitimately carries columns the baseline source lacks.
-        # Reproduced with a three-source probe where one source had one extra
-        # column: hard crash on the first run.
-        #
-        # This cannot be left to the splice path's widen step either. That
-        # fires on ids flagged by file_has_drift_beyond(), which returns the
-        # FIRST mismatching id per file and stops -- for a source whose base
-        # schema already diverges, that is the divergent id, so an extra
-        # column sitting at some later id is never even looked at.
-        #
-        # union_by_name adds exactly the missing fields by name, leaves
-        # existing ones alone, and never renumbers -- so it subsumes the
-        # add_column case and fixes the general one.
-        with target_table.transaction() as txn:
-            with txn.update_schema() as us:
-                us.union_by_name(src_schema)
-            for tab in tabs:
-                txn.append(tab)
-        target_table = cat.load_table(target_id)
-        fresh_id = target_table.schema().find_field(name).field_id
-        rows_this_pass = sum(t.num_rows for t in tabs)
-        rewritten_rows += rows_this_pass
-        logger.info(
-            "  [%s] rewrite: '%s' (from %s) field_id=%d, %d row(s) rewritten + appended (%s)",
-            table_name,
-            name,
-            ns,
-            fresh_id,
-            rows_this_pass,
-            "schema + data committed atomically" if not column_already_exists else "data-only, healing pre-fix state",
-        )
-
-    total = total_new_rows + rewritten_rows
+    relabeled_rows = sum(df.record_count for df in relabeled_files)
+    retired = len(to_delete)
+    retired_rows = sum(df.record_count for df in to_delete)
     elapsed = time.time() - t_start
     logger.info(
-        "  DONE %s: %d file(s) spliced (%d rows, no-rewrite), %d row(s) rewritten/appended, "
-        "%d orphaned file(s) retired (%d stale rows removed) (%.1fs)",
+        "  DONE %s: %d file(s) spliced (%d rows, no copy), %d file(s) relabeled (%d rows, copied "
+        "with a new footer), %d file(s) retired (%d stale rows removed) (%.1fs)",
         table_name,
         len(new_files),
         total_new_rows,
-        rewritten_rows,
-        len(orphaned_files),
-        total_orphaned_rows,
+        len(relabeled_files),
+        relabeled_rows,
+        retired,
+        retired_rows,
         elapsed,
     )
-    return table_name, total_new_rows, rewritten_rows, len(orphaned_files), total_orphaned_rows, elapsed
+    return table_name, total_new_rows, relabeled_rows, retired, retired_rows, elapsed
 
 
 # --------------------------------------------------------------------------
@@ -1370,7 +1420,7 @@ def run(cfg: dict, tables: list = None) -> dict:
         cfg["source_workers"],
     )
 
-    grand_spliced, grand_rewritten = 0, 0
+    grand_spliced, grand_relabeled = 0, 0
     grand_orphaned_files, grand_orphaned_rows = 0, 0
     per_table_timing = []
     with ThreadPoolExecutor(max_workers=cfg["table_workers"]) as ex:
@@ -1378,12 +1428,12 @@ def run(cfg: dict, tables: list = None) -> dict:
         for fut in as_completed(futs):
             t = futs[fut]
             try:
-                table_name, spliced, rewritten, orphaned_files, orphaned_rows, elapsed = fut.result()
+                table_name, spliced, relabeled, orphaned_files, orphaned_rows, elapsed = fut.result()
             except Exception:
                 logger.exception("FAILED registering table '%s'", t)
                 raise
             grand_spliced += spliced
-            grand_rewritten += rewritten
+            grand_relabeled += relabeled
             grand_orphaned_files += orphaned_files
             grand_orphaned_rows += orphaned_rows
             per_table_timing.append((table_name, elapsed))
@@ -1394,10 +1444,10 @@ def run(cfg: dict, tables: list = None) -> dict:
         "tables": len(tables),
         "sources": len(cfg["source_namespaces"]),
         "total_spliced": grand_spliced,
-        "total_rewritten": grand_rewritten,
+        "total_relabeled": grand_relabeled,
         "total_orphaned_files_retired": grand_orphaned_files,
         "total_orphaned_rows_removed": grand_orphaned_rows,
-        "grand_total": grand_spliced + grand_rewritten,
+        "grand_total": grand_spliced + grand_relabeled,
         "wall_clock_seconds": round(wall_clock, 1),
         "slowest_tables": slowest,
     }
@@ -1461,25 +1511,28 @@ def main():
     print("\n=== SUMMARY ===")
     print(f"TABLES: {summary['tables']}  SOURCES: {summary['sources']}")
     print(f"TOTAL SPLICED (no-rewrite): {summary['total_spliced']}")
-    print(f"TOTAL REWRITTEN (collision-only): {summary['total_rewritten']}")
-    print(f"TOTAL ORPHANED FILES RETIRED (copy-on-write cleanup): {summary['total_orphaned_files_retired']}")
+    print(f"TOTAL RELABELED (copied with a new footer, no rewrite): {summary['total_relabeled']}")
+    print(f"TOTAL FILES RETIRED (copy-on-write cleanup): {summary['total_orphaned_files_retired']}")
     print(f"TOTAL STALE ROWS REMOVED: {summary['total_orphaned_rows_removed']}")
     print(f"GRAND TOTAL: {summary['grand_total']}")
     print(f"WALL CLOCK: {summary['wall_clock_seconds']}s")
     if summary["total_orphaned_files_retired"] > 0:
         print(
-            f"\nNOTE: {summary['total_orphaned_files_retired']} file(s) previously spliced in were retired this "
-            "run because they no longer exist in their source's current snapshot (a copy-on-write update or "
-            "delete rewrote them at the source). Retiring them only rewrites the small manifest metadata file "
-            "that referenced them -- no Parquet data was read or rewritten -- but it does mean this run's "
-            "commit was an OVERWRITE-type snapshot, not a pure append, for every table where this happened."
+            f"\nNOTE: {summary['total_orphaned_files_retired']} file(s) were retired this run because the "
+            "source file they stand for no longer exists in its source's current snapshot (a copy-on-write "
+            "update or delete replaced it at the source), or because they were written by this tool's old "
+            "rewrite path. Retiring them only rewrites the small manifest metadata file that referenced them "
+            "-- no Parquet data was read or rewritten -- but it does mean this run's commit was an "
+            "OVERWRITE-type snapshot, not a pure append, for every table where this happened."
         )
-    if summary["total_rewritten"] > 0:
+    if summary["total_relabeled"] > 0:
         print(
-            f"\nNOTE: {summary['total_rewritten']} row(s) went through the rewrite/collision path this run. "
-            "That's expected on the first run after a genuine cross-source field-id collision, but "
-            "if a specific source keeps landing on this path across repeated runs, its schema is "
-            "drifting more than this tool's steady-state cost model assumes -- worth a closer look."
+            f"\nNOTE: {summary['total_relabeled']} row(s) were relabeled this run: their source disagrees "
+            "with the target about what a field id means, so each of their files was copied with a "
+            "corrected Parquet footer instead of being spliced by reference. No data was decoded or "
+            "rewritten, but the copies do take storage. Expected for sources whose tables were created "
+            "with their columns in a different order; a source's files are relabeled again only when "
+            "the writer replaces them."
         )
     print(f"Slowest 5 tables (elapsed, includes queueing behind the thread pool): {summary['slowest_tables']}")
 

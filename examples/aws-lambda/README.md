@@ -201,6 +201,7 @@ Environment variables this function reads (see `lambda_function.py`'s
 | `SOURCE_NAMESPACE_PATTERN` | yes, unless using the explicit list above | A glob (`tenant_*`, not SQL `LIKE`) resolved against the catalog's real namespaces on every run -- use this instead of `SOURCE_NAMESPACES` once you have more sources than is reasonable to hand-list, or want new tenant namespaces picked up automatically without a config change. Set exactly one of these two, not both. The resolved list is always logged -- check CloudWatch Logs after a pattern-based run's first invoke to confirm it matched what you expected. |
 | `SOURCE_ID_COLUMN` | yes | |
 | `TABLE_WORKERS` / `SOURCE_WORKERS` | no | Default to 8, same as `load_config()`'s defaults. |
+| `SELF_CONTAINED_TARGET` | no | `true` copies every source's files into the target so it reads under its own vended credential; see the main README's "When sources disagree about field ids." Default `false`. Either way this function's role still needs no S3 permissions: relabeled copies are read and written with each table's vended credential. |
 
 **Update code on a later change** with `aws lambda update-function-code
 --function-name unified-lake-tables-consolidation --s3-bucket YOUR_BUCKET
@@ -270,7 +271,7 @@ running this against a real customer's data long-term, consider:
 - **VPC configuration**, if your Polaris catalog or its underlying S3
   storage aren't reachable from Lambda's default public networking path.
 - **Alerting on failure** -- wire this function's errors (or a non-zero
-  `total_rewritten` count you didn't expect) to an SNS topic or CloudWatch
+  `total_relabeled` count you didn't expect) to an SNS topic or CloudWatch
   Alarm rather than only checking logs after the fact.
 - **Concurrency controls** (Lambda reserved concurrency = 1 for this
   function) if you have any risk of a second trigger overlapping with the

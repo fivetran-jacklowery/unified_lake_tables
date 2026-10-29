@@ -335,9 +335,9 @@ def test_type_divergence_widens_target():
         assert tgt_types["amount"] == "long", \
             f"target kept the narrow type: amount is {tgt_types['amount']}"
         assert got.num_rows == 2 * n, f"expected {2*n} rows, got {got.num_rows}"
-        assert results[0]["total_rewritten"] == 0, (
+        assert results[0]["total_relabeled"] == 0, (
             "widening a type must not rewrite anything -- Iceberg reads a narrow file "
-            f"through a wider schema; got {results[0]['total_rewritten']} rewritten rows"
+            f"through a wider schema; got {results[0]['total_relabeled']} relabeled rows"
         )
         for ns in schemas:
             vals = sorted(r["amount"] for r in got.to_pylist()

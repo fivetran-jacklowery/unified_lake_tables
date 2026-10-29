@@ -100,9 +100,12 @@ used to carry as unverified are now findings:
    forces `source_connection_id` to field id 100000 by assigning an
    `itertools.count` to a private pyiceberg `UpdateSchema` attribute. On a
    live Glue catalog it lands at exactly 100000.
-2. **Glue's `CreateTable` does not renumber field ids.** Asked for ids 1-4,
-   got ids 1-4. The two-step create-then-widen dance is still correct, and
-   nothing Glue-specific is needed around it.
+2. **Glue renumbers field ids on create, exactly like Polaris.** Asked for
+   `{a:5, b:3, c:9}`, got `{a:1, b:2, c:3}` — sequential, in declaration
+   order. The two-step create-then-widen dance is therefore *required* here,
+   not merely harmless, and it works. (An earlier version of this claimed
+   ids were preserved; that test asked for 1-4 in declaration order, which
+   renumbering produces anyway, so it proved nothing.)
 
 Also confirmed live on Glue, not just against the local SQLite catalog the
 rest of `tests/` uses: no row loss, no rerun duplication, NULLs preserved,

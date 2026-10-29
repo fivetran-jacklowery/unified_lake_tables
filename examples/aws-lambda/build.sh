@@ -69,6 +69,9 @@ fi
 echo "Copying handler and shared consolidation script ..."
 cp "$HERE/lambda_function.py" "$BUILD_DIR/"
 cp "$REPO_ROOT/scripts/register_consolidation.py" "$BUILD_DIR/"
+# Imported at module level by register_consolidation.py (the relabel path).
+# Omitting it fails at cold start with ModuleNotFoundError.
+cp "$REPO_ROOT/scripts/parquet_footer.py" "$BUILD_DIR/"
 # register_consolidation.py used to import this at module level, and omitting
 # it failed at Lambda cold start with ModuleNotFoundError. That import went
 # away when the collision-rewrite guard stopped scanning data (it now counts

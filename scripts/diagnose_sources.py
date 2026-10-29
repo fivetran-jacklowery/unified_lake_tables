@@ -36,9 +36,10 @@ with pyiceberg and reads them with pyiceberg will always agree with itself.
      was never aimed at, and it would catch that expectation changing.
 
   3. FIELD-ID AGREEMENT ACROSS SOURCES. Where sources disagree, each
-     divergent source is rewritten in full rather than spliced -- correct,
-     but it forfeits the no-rewrite premise that is the point of the tool.
-     Better to know the fraction up front than to discover it from a bill.
+     divergent source's files are relabeled rather than spliced: copied
+     with a corrected Parquet footer. No data is decoded or rewritten, but
+     the copies take storage, and a copy is refreshed whenever the writer
+     replaces its source file. Better to know the fraction up front.
 
 (3) also answers the question worth settling before any large rollout: of N
 tables, how many actually have agreeing ids and can be consolidated cheaply?
@@ -104,6 +105,31 @@ def survey_table(cat, table_name, source_namespaces):
 
     if len(schemas) > 1:
         out["disagreements"] = find_field_id_disagreements(schemas)
+
+    # How many DISTINCT field-id layouts are there across these sources?
+    #
+    # This is the number that decides how much of the no-rewrite premise is
+    # salvageable when sources disagree. Iceberg resolves a file's columns by
+    # field id against the table's single schema, and a manifest entry has
+    # nowhere to record "this file's id 14 is the table's id 13" -- it carries
+    # file_path, partition, counts and bounds, all keyed by field id, and no
+    # per-file schema. So one target table can only splice sources that
+    # already agree.
+    #
+    # But sources that agree with EACH OTHER can share a target even if they
+    # disagree with the rest. Group the sources by id layout, give each group
+    # its own consolidated table, and every group splices at zero rewrite
+    # cost. You then union G tables instead of N sources, where G is the count
+    # below -- all of the correctness, none of the rewriting, and the planning
+    # cost falls by N/G.
+    #
+    # G == 1 means the whole table consolidates for free. G == N means every
+    # source has its own layout and grouping buys nothing.
+    layouts = {}
+    for ns, schema in schemas.items():
+        sig = tuple(sorted((f.name, f.field_id) for f in schema.fields))
+        layouts.setdefault(sig, []).append(ns)
+    out["layout_groups"] = sorted(layouts.values(), key=lambda g: (-len(g), g[0]))
     return out
 
 
@@ -127,7 +153,8 @@ def main():
 
     tot_files = tot_rows = tot_no_stats = tot_deletes = 0
     clean_tables, divergent_tables, failed_tables = [], [], []
-    divergence_hist = Counter()
+    group_hist = Counter()
+    groups_total = 0
 
     for i, tname in enumerate(tables, 1):
         r = survey_table(cat, tname, sources)
@@ -139,7 +166,9 @@ def main():
             tot_no_stats += s["files_without_null_counts"]
             tot_deletes += s["delete_files"]
         n_dis = len(r["disagreements"])
-        divergence_hist[n_dis] += 1
+        n_groups = len(r.get("layout_groups") or [[]])
+        group_hist[n_groups] += 1
+        groups_total += n_groups
         (clean_tables if n_dis == 0 else divergent_tables).append((tname, n_dis))
         if args.verbose or n_dis:
             print(f"[{i}/{len(tables)}] {tname}: {n_dis} contested field id(s)")
@@ -177,10 +206,31 @@ def main():
     print(f"  tables whose sources fully agree   : {len(clean_tables)}/{n}"
           f" ({100*len(clean_tables)/n:.0f}%)  <- spliceable, no rewrite")
     print(f"  tables with any disagreement       : {len(divergent_tables)}/{n}"
-          f" ({100*len(divergent_tables)/n:.0f}%)  <- divergent sources rewritten in full")
+          f" ({100*len(divergent_tables)/n:.0f}%)  <- divergent sources relabeled (copied)")
     if divergent_tables:
         worst = sorted(divergent_tables, key=lambda x: -x[1])[:5]
         print("  worst: " + ", ".join(f"{t} ({c} ids)" for t, c in worst))
+    print("\n" + "=" * 70)
+    print("DISTINCT FIELD-ID LAYOUTS (this decides how much is salvageable)")
+    print("=" * 70)
+    print("  A target table can only SPLICE sources that agree with it on field ids --")
+    print("  Iceberg resolves by id and a manifest entry cannot record a per-file id")
+    print("  mapping. Every other source is relabeled: copied with a corrected footer.")
+    print("  To avoid even the copies, group sources by layout, consolidate within each")
+    print("  group, and union the groups: G tables instead of N sources, nothing copied.\n")
+    n_src = len(sources)
+    for g in sorted(group_hist):
+        verdict = ("1 target, nothing copied" if g == 1
+                   else "grouping buys nothing" if g >= n_src
+                   else f"{g} targets, nothing copied")
+        print(f"  {group_hist[g]:5} table(s) need {g} target(s)  -- {verdict}")
+    if tables:
+        avg = groups_total / len(tables)
+        print(f"\n  average union width: {n_src} sources -> {avg:.1f} grouped targets"
+              f"  ({'no improvement' if avg >= n_src else f'{n_src/avg:.1f}x fewer branches'})")
+        print("  (vs. consolidating all sources into one target, which would rewrite")
+        print("   every divergent source in full)")
+
     print(f"\n  total: {tot_files} files, {tot_rows:,} rows across {len(sources)} sources")
     if failed_tables:
         print(f"\n  {len(failed_tables)} table(s) could not be surveyed -- see ERROR lines above")

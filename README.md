@@ -71,14 +71,15 @@ time prunes to just that source's files.
 The harder, more interesting part -- and the actual reason this needs more
 than an afternoon of manifest-splicing code -- is a real correctness risk
 this technique introduces: Iceberg resolves columns by an internal number
-(a "field id") baked into each file, not by column name. Two sources that
-evolve their schemas independently can land a new column on the exact same
-field id with two completely different meanings, and Iceberg won't error --
-it'll silently return the wrong column's data. This was reproduced against
-real infrastructure, not just reasoned about, and this tool includes the
-validated three-layer fix for it (reserve / widen-for-free / rewrite-only-
-on-collision). See [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for the full
-mechanism.
+(a "field id") baked into each file, not by column name. Two sources can
+disagree about what a field id means -- because they evolved independently
+and landed a new column on the same id, or, far more often, because their
+tables were created with the same columns in a different order -- and
+Iceberg won't error; it'll silently return the wrong column's data. This was
+reproduced against real infrastructure, not just reasoned about, and this
+tool includes the validated fix for it (reserve / widen-for-free /
+relabel-on-disagreement). See "When sources disagree about field ids" below
+and [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for the full mechanism.
 
 ## Prerequisites
 
@@ -145,19 +146,90 @@ Five steps, run per table, per registration pass:
 3. **Detect collisions.** If two sources independently land different new
    columns on the same internal field id, that's flagged rather than
    silently resolved by luck.
-4. **Rewrite (rare).** Only a genuine collision triggers an actual data
-   rewrite, and only for the small number of newly-drifted rows involved,
-   never a source's full history.
+4. **Relabel.** A file whose source disagrees with the target about what
+   a field id means can't be spliced. It's copied instead, with a
+   corrected Parquet footer that carries the target's field ids. Nothing
+   is decoded or rewritten. See "When sources disagree about field ids"
+   below.
 5. **Retire orphaned files.** If a source's Managed Data Lake writer
-   copy-on-write-rewrites a file this tool already spliced in (see "What
-   this does NOT yet handle" below), the stale reference is detected and
-   removed from the target's manifest in the same commit as its
-   replacement gets spliced in -- a metadata-only operation, no Parquet
-   data read or rewritten.
+   copy-on-write-rewrites a file this tool already spliced in or relabeled
+   (see "What this does NOT yet handle" below), the stale entry is detected
+   and removed from the target's manifest in the same commit as its
+   replacement is added -- a metadata-only operation, no Parquet data read
+   or rewritten.
+
+The data changes from steps 2-5 land as **one commit** per table, so a
+reader sees a whole refresh or none of it.
 
 Full technical walkthrough, including the exact private pyiceberg mechanism
 this depends on and why it took three attempts to get right: see
 [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md).
+
+## When sources disagree about field ids
+
+Fivetran assigns field ids in column order when it creates a table, and it
+does not guarantee column order across connections. Two connections of the
+same connector can therefore land the same table with the same column names
+and types but different field ids. In a multi-tenant deployment this can be
+the norm rather than the exception: `scripts/diagnose_sources.py` reports
+how many distinct field-id layouts your sources have, per table, before you
+run anything.
+
+A file from such a source can't be spliced by reference. Its data is fine;
+only its footer's field ids are wrong for the target. So the tool
+**relabels** it: it writes a copy that is byte-for-byte identical up to the
+Parquet footer, followed by a new footer whose field ids are the target's
+ids for the same column names. Column data, page indexes and row groups are
+located by byte offset, so they're all still valid. Nothing is decoded or
+re-encoded, and memory use is one file at a time. The mechanism is in
+[`scripts/parquet_footer.py`](scripts/parquet_footer.py).
+
+**What it costs.** A relabeled file is a copy, so it takes storage, the
+same as a rewritten one would. What it removes is the compute: a rewrite
+has to read and re-encode every row, while a relabel is a byte copy. On S3
+with a credential that covers both sides, most of the copy happens inside
+S3 (see below).
+
+**How refresh works.** Each relabeled copy's path is derived from the path
+of the source file it came from. When the writer replaces a source file
+(copy-on-write, on any UPDATE or DELETE), the copy that stands for the old
+file is retired and the new file is relabeled, in the same commit. Cost
+tracks the files the writer replaced, not the size of the table. A rerun
+with no source changes commits nothing.
+
+**How the bytes are copied** depends on the catalog backend:
+
+| Backend | Copy | Credentials |
+|---|---|---|
+| Polaris (default) | Read with the source table's vended credential, write with the target's. The bytes pass through the machine running the tool. | Vended only. Nothing new to grant; the Lambda example still needs no S3 permissions. |
+| Glue | S3 server-side copy (`UploadPartCopy`) of everything before the footer; only the new footer is uploaded. Files under 5 MiB are downloaded and re-uploaded. | The ambient IAM identity Glue already uses. Set `RELABEL_SERVER_SIDE_COPY=false` to copy through FileIO instead. |
+
+**Self-contained targets.** By default, sources that agree with the target
+are still spliced by reference, so the target's manifest points at files
+under other tables' locations. Polaris vends a credential that covers only
+the table being read, so an engine reading the target through vended
+credentials can't open those files (see Troubleshooting). Set
+`self_contained_target: true` in `config.yaml` (or `SELF_CONTAINED_TARGET=true`
+for the Lambda example) to relabel every source's files instead. The target
+then holds only its own files and reads under its own vended credential,
+with no storage location to widen. The price is a copy of every file.
+Switching it on for an existing target replaces the spliced references with
+copies in one commit.
+
+**Upgrading from a version that rewrote.** Earlier versions physically
+rewrote divergent sources, and those rewritten files can't be tied back to
+source files, so they couldn't follow copy-on-write. That left
+updated rows stale, kept deleted rows, and duplicated rows when a source
+grew. On the first run of this version, those files are retired and the
+source's files are relabeled in their place, in one commit. No manual
+cleanup is needed.
+
+**Limits.** Relabeling supports flat (non-nested) schemas and unencrypted
+Parquet. A source type must equal the target's or be one Iceberg promotes on
+read (`int` to `long`, say); for promoted columns the file's min/max bounds
+are dropped from the manifest, which costs some pruning but never
+correctness. Anything else stops the run with an explicit error rather than
+guessing.
 
 ## What this does NOT yet handle
 
@@ -292,25 +364,23 @@ not landing where expected, you likely tried to set them at creation time.
 **A rerun added rows I didn't expect, or added zero rows when I expected
 some.** Re-running `register_consolidation.py` against a source with
 nothing new should be a safe no-op -- it tracks already-registered file
-paths in the target manifest, and separately checks row content before
-re-appending on the rewrite/collision path. Run
+paths in the target manifest, including the deterministic paths of
+relabeled copies. Run
 `scripts/verify_consolidation.py` to check for duplicate files or row-count
 mismatches. If you see duplicates, please report it -- an earlier,
 unfixed version of this exact technique had precisely this bug (a naive
 version silently doubled every row on a second run) before the
 already-registered-paths check existed.
 
-**A run logs a "COLLISION" warning.** This means two of your sources
-independently added a different new column that landed on the same
-internal Iceberg field id -- expected to happen eventually at scale, since
-every source numbers its own schema independently from the same starting
-point. This is handled automatically (see "How it works" above): the
-tool picks a deterministic owner for the id within that run and rewrites
-just the colliding source's drifted rows onto a fresh id, at a real but
-small cost. Nothing is lost, but if you're seeing this repeatedly for the
-same source across runs, that source's schema is drifting more than this
-tool's cost model assumes -- worth a closer look, and the run's summary
-output flags this explicitly.
+**A run logs a "COLLISION" warning, or a warning that sources disagree
+about what field ids mean.** Two of your sources use the same internal
+Iceberg field id for different columns -- either a new column landed on an
+occupied id, or the tables were created with their columns in a different
+order. This is handled automatically (see "When sources disagree about
+field ids" above): the losing source's files are relabeled onto the
+target's ids. Nothing is lost and nothing is rewritten, but each relabeled
+file is a copy. The warning lists how many files per source will be
+copied, so you can see the storage cost before it lands.
 
 **A column the source has now shows up under a different name than in the
 consolidated table, but the data is otherwise correct.** This means a true
@@ -342,10 +412,12 @@ is fixed** (see `CHANGELOG.md`'s "Fixed: the ACCESS_DENIED gap above, in
 the script itself" -- it now reads through the relevant source table's own
 vended credential when the target's doesn't cover a file). If you hit this
 from a **downstream engine** (e.g. Snowflake) reading the consolidated
-table directly, that's still a separate, open question -- check whether
-that engine's own catalog integration needs a broader storage-location
-allowlist than a single table's default location; that's not something
-this tool's scripts can fix from the outside.
+table directly, either give that engine's catalog integration a broader
+storage-location allowlist than a single table's default location, or set
+`self_contained_target: true` (see "When sources disagree about field ids"
+above) so the target holds only its own files. The second was verified
+live: Snowflake read a self-contained target through a vended-credential
+catalog integration with no widened location.
 
 **`register_consolidation.py` used to be able to hit this same
 ACCESS_DENIED error during collision handling -- fixed.** Reproduced live:
