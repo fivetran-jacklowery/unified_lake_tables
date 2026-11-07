@@ -231,6 +231,57 @@ are dropped from the manifest, which costs some pruning but never
 correctness. Anything else stops the run with an explicit error rather than
 guessing.
 
+## EXPERIMENTAL: realigning SOURCE field ids (modifies source tables)
+
+> **Warning.** Everything else in this repository only *reads* source
+> tables. `scripts/realign_source_field_ids.py` **drops a Fivetran-managed
+> source table from the catalog and re-creates it.** We expect it to work and
+> have tested it, but it changes tables Fivetran owns, it is not supported or
+> endorsed by Fivetran, and it has not been tested on every catalog or
+> connector. **Try it in a dev environment first.**
+
+Relabeling is correct, but for a source whose layout disagrees with the
+target it never ends: each file the writer replaces is copied again. This
+script fixes a source's layout once instead, without a resync. It copies the
+table's current files with the target's field ids written into the footer
+(data pages copied byte for byte), then re-creates the table with a schema
+that uses those ids. The connector carries on from where it was, and from
+then on the source is spliced by reference with no copies.
+
+**Tested** on Polaris with a Connector SDK source: after the swap, three
+copy-on-write syncs ran with no resync, the writer kept the new ids, values
+matched row for row, and pyiceberg, DuckDB and Snowflake all read it
+correctly. **Not tested:** AWS Glue as the catalog, database connectors such
+as SQL Server, a column added at the source after the swap, very large
+tables.
+
+```bash
+# 1. read-only plan: which columns change id, how many files would be copied
+python scripts/realign_source_field_ids.py --config config.yaml --table accounts --sources tenant_a
+# 2. PAUSE THE CONNECTOR, wait for any running sync to finish, then:
+python scripts/realign_source_field_ids.py apply --config config.yaml --table accounts --sources tenant_a \
+    --execute --i-understand-this-modifies-source-tables
+# 3. resume the connector, check a sync succeeds, run register_consolidation.py
+# 4. undo, only before the connector writes again:
+python scripts/realign_source_field_ids.py rollback --record realign-records/<file>.json \
+    --execute --i-understand-this-modifies-source-tables
+# 5. once satisfied, delete the original files (no rollback after this):
+python scripts/realign_source_field_ids.py finalize --record realign-records/<file>.json \
+    --execute --i-understand-this-modifies-source-tables
+```
+
+Safety rails: it does nothing without both flags; it writes a rollback record
+before changing anything; it aborts without touching the table if the source
+commits during the copy (connector not paused); it rolls back automatically
+if the re-created table's ids, row count or a sample of values don't match;
+and rollback refuses to discard commits the writer made after the swap.
+
+**Readers.** The table's UUID changes. A Snowflake `ICEBERG TABLE` pointing
+at it stops auto-refreshing and keeps serving the old snapshot from cache:
+re-create it with `CREATE OR REPLACE ICEBERG TABLE`. A catalog-linked
+database re-links by itself within minutes. Reads that start during the
+swap itself (seconds) fail.
+
 ## What this does NOT yet handle
 
 Read this before running this against anything you care about.

@@ -4,6 +4,28 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Added (EXPERIMENTAL): `scripts/realign_source_field_ids.py` -- MODIFIES SOURCE TABLES
+
+The first script in this repository that writes to a source table. It drops
+a Fivetran-managed source table from the catalog and re-creates it with the
+target's field ids, after copying its current files with corrected footers,
+so the source is spliced by reference from then on instead of relabeled on
+every copy-on-write. No resync. See the README section and the script's
+docstring for the warning, what was tested and what was not.
+
+Findings that shaped it:
+* Polaris refuses schema changes to Fivetran-managed tables ("schema changes
+  are not allowed"), so an in-place fix is impossible; drop + re-create is
+  allowed, including one atomic create-with-files commit.
+* Catalogs and pyiceberg renumber field ids 1..n in declaration order on
+  create, so ids after a gap are placed by schema evolution, and the result
+  is read back and checked.
+* The Fivetran writer continued incrementally into the re-created table
+  (three copy-on-write syncs, live) and kept the new ids.
+* A Snowflake Iceberg table on the source stops auto-refreshing when the
+  UUID changes (GENERALIZED_PIPE_STOPPED) and must be re-created; a
+  catalog-linked database re-links by itself.
+
 ### Fixed and changed: scale problems found in a customer's dev-run logs (2026-11-04/05)
 
 Six tenants, 139 tables, 7.8B rows, on the Glue backend. Each item below is
