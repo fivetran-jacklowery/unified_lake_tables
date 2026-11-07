@@ -25,7 +25,8 @@ Because the manifest is separate from the data, you can build a brand-new
 target table whose manifest points at files that already belong to a
 different (source) table -- without copying, rewriting, or even reading those
 files' contents. This is what `register_consolidation.py` does: for every
-table name common to all your configured source namespaces, it constructs a
+table name any of your configured source namespaces has (registered from
+each source that has it), it constructs a
 target table and appends `DataFile` entries that point at the *same physical
 files* the source tables already reference, tagged with a partition value
 identifying which source they came from.

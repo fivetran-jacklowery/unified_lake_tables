@@ -61,6 +61,29 @@ table_workers: 8
 # have more sources than tables.
 source_workers: 8
 
+# How many relabel copies run at once, shared across ALL tables in the run.
+# Each copy costs ~1.5 s of S3 round trips regardless of file size, so a
+# table's relabel time is roughly files / relabel_workers (5,373 files took
+# 26 min at the old effective limit of 6). Raise it for big initial loads;
+# S3 itself is not the bottleneck at these levels.
+relabel_workers: 32
+
+# Large add-only relabels (an initial load) commit every N files, so a crash
+# loses one batch instead of the whole run; the rerun skips what was
+# committed. Refreshes that retire files always commit atomically. 0 = off.
+relabel_commit_batch: 500
+
+# Storage cleanup. A retired file only leaves the CURRENT snapshot; without
+# cleanup every relabeled copy ever replaced stays in S3. Each run expires
+# target snapshots older than this window and deletes the files only they
+# referenced -- never anything outside the target's own location. Keep it
+# longer than your slowest reader's refresh interval (Snowflake catalog
+# integrations: REFRESH_INTERVAL_SECONDS). 0 = off.
+cleanup_grace_minutes: 1440
+# Run cleanup at most about this often per table. It reads every kept
+# snapshot's manifests, which is expensive with frequent event-driven runs.
+cleanup_interval_minutes: 60
+
 # --- Optional: self-contained target. Default false. ---
 #
 # By default, files from sources that already agree with the target about

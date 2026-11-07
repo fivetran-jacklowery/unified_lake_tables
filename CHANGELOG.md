@@ -4,6 +4,92 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Added (EXPERIMENTAL): `scripts/realign_source_field_ids.py` -- MODIFIES SOURCE TABLES
+
+The first script in this repository that writes to a source table. It drops
+a Fivetran-managed source table from the catalog and re-creates it with the
+target's field ids, after copying its current files with corrected footers,
+so the source is spliced by reference from then on instead of relabeled on
+every copy-on-write. No resync. See the README section and the script's
+docstring for the warning, what was tested and what was not.
+
+Findings that shaped it:
+* Polaris refuses schema changes to Fivetran-managed tables ("schema changes
+  are not allowed"), so an in-place fix is impossible; drop + re-create is
+  allowed, including one atomic create-with-files commit.
+* Catalogs and pyiceberg renumber field ids 1..n in declaration order on
+  create, so ids after a gap are placed by schema evolution, and the result
+  is read back and checked.
+* The Fivetran writer continued incrementally into the re-created table
+  (three copy-on-write syncs, live) and kept the new ids.
+* On AWS Glue, apply / rollback / re-apply / consolidation pass the live
+  test (`tests/test_glue_live.py`, now 19 checks, which also covers the
+  scale fixes: properties as the run record, skip-unchanged, S3 cleanup).
+  The Fivetran writer on Glue after a swap is still untested.
+* A Snowflake Iceberg table on the source stops auto-refreshing when the
+  UUID changes (GENERALIZED_PIPE_STOPPED) and must be re-created; a
+  catalog-linked database re-links by itself.
+
+### Fixed and changed: scale problems found in a customer's dev-run logs (2026-11-04/05)
+
+Six tenants, 139 tables, 7.8B rows, on the Glue backend. Each item below is
+tied to what the logs showed; `tests/test_scale_fixes.py` covers all of them.
+
+**Fixed: `verify_consolidation.py` ran out of memory (exit 137).** It counted
+rows with `scan().to_arrow().num_rows`, materializing every column of whole
+tables -- 7 minutes for one 5.3M-row tenant, then a kill. It now streams one
+column batch by batch (still opening every file, so unreadable data still
+fails) and verifies tables in parallel (`--workers`). Note for anyone counting
+with pyiceberg 0.10: filtering on an identity-partition column that is not in
+`selected_fields` silently returns zero rows.
+
+**Fixed: verify reported lag as corruption.** A source that moved on by one
+row after registration was an ERROR. Each run now records, in target table
+properties, the source snapshot the target reflects. Verify checks the
+target against its own manifest (a mismatch is always an error) and against
+the source at that snapshot; if the source has moved on since, it reports
+LAG, not failure.
+
+**Fixed: a failed read of the target could duplicate everything.**
+`already_registered_by_source()` swallowed every exception, so a transient
+catalog or S3 error meant "nothing registered" and the run spliced every
+file in again. Only a target with no snapshot is treated as empty now.
+
+**Changed: relabel concurrency is its own setting (`relabel_workers`,
+default 32).** It was tied to `source_workers`, so one table's 5,373
+relabels ran on 6 threads for 26 minutes. Each copy is ~1.5 s of S3 round
+trips whatever its size; time is files / workers. One pool is shared by all
+tables so total S3 concurrency stays capped.
+
+**Changed: large initial relabels commit in batches (`relabel_commit_batch`,
+default 500).** A crash late in a long load lost every copy; now it loses one
+batch and the rerun copies only what was not committed. Runs that retire
+files still commit atomically.
+
+**Changed: unchanged sources are skipped.** 106 of 138 tables in a refresh
+had no changes and still cost ~10 s each re-planning all sources. A source
+whose current snapshot is the one the target recorded is no longer planned;
+a table with no changed source does no work at all. Everything is re-planned
+when the registration mode changes, when the target was last written by
+something other than this tool, or with `--full-refresh`.
+
+**Added: `--sources` (CLI) / `{"sources": [...]}` (Lambda event).** Plan only
+the sources an event says changed, so a per-table drain costs what changed,
+not how many tenants there are. Other sources' files are left untouched.
+
+**Changed: tables are discovered by union, not intersection.** One tenant
+lacking `clientaccount` dropped it for every tenant. A table is now
+registered from each source that has it; a source without it retires
+nothing. Behaviour change: tables that exist in only some sources are now
+consolidated.
+
+**Added: storage cleanup (`cleanup_grace_minutes`, default 1440).** A
+retired file only left the current snapshot, so relabeled copies replaced by
+copy-on-write accumulated in S3 forever. Each run now expires target
+snapshots older than the grace window and deletes the files only they
+referenced -- never anything outside the target's own location. Keep the
+window longer than your slowest reader's refresh interval. 0 turns it off.
+
 ### Changed: divergent sources are relabeled, not rewritten -- and refresh now tracks copy-on-write
 
 **The problem.** Fivetran assigns field ids in column order when it creates
