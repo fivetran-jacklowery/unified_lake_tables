@@ -23,9 +23,10 @@ that an internal sandbox script didn't:
      point -- give a glob pattern (source_namespace_pattern, e.g.
      "tenant_*") and this script resolves it against the catalog's actual
      namespaces itself (see resolve_source_namespaces()). Either way, this
-     script then auto-discovers which table NAMES exist in ALL of those
-     namespaces (see discover_common_tables()) rather than requiring every
-     table to be enumerated by hand.
+     script then auto-discovers which table NAMES exist in those
+     namespaces (see discover_tables(); a table is registered from every
+     source that has it) rather than requiring every table to be
+     enumerated by hand.
 
 WHAT THIS ACTUALLY DOES, in one paragraph: for every table name common to
 all configured source namespaces, it creates (or reuses) one target table
@@ -70,6 +71,7 @@ from dotenv import load_dotenv
 from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.exceptions import ResolveError
+from pyiceberg.expressions import In
 from pyiceberg.manifest import DataFile, DataFileContent
 from pyiceberg.schema import Schema, promote
 from pyiceberg.typedef import Record
@@ -214,6 +216,9 @@ def load_config(path: str) -> dict:
 
     cfg.setdefault("table_workers", 8)
     cfg.setdefault("source_workers", 8)
+    cfg.setdefault("relabel_workers", DEFAULT_RELABEL_WORKERS)
+    cfg.setdefault("relabel_commit_batch", DEFAULT_RELABEL_COMMIT_BATCH)
+    cfg.setdefault("cleanup_grace_minutes", DEFAULT_CLEANUP_GRACE_MINUTES)
     cfg.setdefault("self_contained_target", False)
     return cfg
 
@@ -458,6 +463,39 @@ def discover_common_tables(cat: Catalog, source_namespaces: list) -> list:
     return sorted(common)
 
 
+def discover_tables(cat: Catalog, source_namespaces: list, workers: int = 8) -> dict:
+    """{table name: set of source namespaces that have it} -- every table ANY
+    configured source has, not just the ones ALL of them have.
+
+    discover_common_tables() took the intersection, so one tenant missing a
+    table dropped that table for every tenant: a customer's run skipped
+    'clientaccount' entirely because one of six sources lacked it, and across
+    hundreds of tenants the intersection keeps shrinking. A table is now
+    registered from whichever sources have it. A source WITHOUT the table is
+    simply not part of that table's run -- its absence never retires
+    anything already registered for it."""
+    def _list(ns):
+        try:
+            return ns, {identifier[-1] for identifier in cat.list_tables(ns)}
+        except Exception as e:
+            raise SystemExit(f"Could not list tables in source namespace '{ns}': {e}")
+
+    by_table = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(source_namespaces)))) as ex:
+        for ns, names in ex.map(_list, source_namespaces):
+            if not names:
+                logger.warning("Source namespace '%s' has no tables.", ns)
+            for name in names:
+                by_table.setdefault(name, set()).add(ns)
+    partial = sorted(t for t, have in by_table.items() if len(have) < len(source_namespaces))
+    if partial:
+        logger.info(
+            "%d table(s) exist in only some source namespaces; each is registered from the sources "
+            "that have it: %s", len(partial), partial[:20] + (["..."] if len(partial) > 20 else []),
+        )
+    return by_table
+
+
 def ensure_namespace(cat: Catalog, ns: str) -> None:
     try:
         cat.create_namespace(ns)
@@ -582,7 +620,7 @@ def file_has_drift_beyond(f, known_field_names: dict, src_schema):
     return None
 
 
-def already_registered_by_source(target_table) -> dict:
+def already_registered_by_source(target_table, source_id_column: str = None, sources: list = None) -> dict:
     """Every file currently in the target table's manifest, grouped by which
     source namespace it was spliced in from (via the identity partition on
     source_id_column -- f.partition[0] is that source's namespace string).
@@ -644,20 +682,94 @@ def already_registered_by_source(target_table) -> dict:
     """
     by_source, spliced, relabeled, legacy = {}, {}, {}, {}
     target_location = target_table.metadata.location
-    try:
-        for task in target_table.scan().plan_files():
-            f = task.file
-            src = f.partition[0]
-            by_source.setdefault(src, {})[f.file_path] = f
-            if not f.file_path.startswith(target_location):
-                spliced.setdefault(src, {})[f.file_path] = f
-            elif f"/{RELABELED_DIR}/" in f.file_path:
-                relabeled.setdefault(src, {})[f.file_path] = f
-            else:
-                legacy.setdefault(src, {})[f.file_path] = f
-    except Exception:
-        pass
+    # A brand-new target has no snapshot and so nothing registered. ANY error
+    # reading an existing target's manifests must propagate: this used to be
+    # wrapped in `except Exception: pass`, which turned a transient catalog or
+    # S3 failure into "nothing is registered" -- and the run then spliced every
+    # source file in a second time, the exact duplication this function exists
+    # to prevent.
+    if target_table.current_snapshot() is None:
+        return by_source, spliced, relabeled, legacy
+    # Restricted to the sources this run is processing: the identity
+    # partition on source_id_column lets the scan skip every manifest that
+    # only holds other sources' files, instead of reading the whole target.
+    scan = (
+        target_table.scan(row_filter=In(source_id_column, tuple(sources)))
+        if source_id_column and sources else target_table.scan()
+    )
+    for task in scan.plan_files():
+        f = task.file
+        src = f.partition[0]
+        by_source.setdefault(src, {})[f.file_path] = f
+        if not f.file_path.startswith(target_location):
+            spliced.setdefault(src, {})[f.file_path] = f
+        elif f"/{RELABELED_DIR}/" in f.file_path:
+            relabeled.setdefault(src, {})[f.file_path] = f
+        else:
+            legacy.setdefault(src, {})[f.file_path] = f
     return by_source, spliced, relabeled, legacy
+
+
+SOURCE_SNAPSHOT_PREFIX = "consolidation.source-snapshot."
+REGISTRATION_MODE_KEY = "consolidation.mode"
+# Stamped into the summary of every snapshot this tool commits. A current
+# target snapshot WITHOUT it was written by something else, so the recorded
+# source snapshots no longer describe the target and every source is
+# re-planned.
+WRITER_SUMMARY = {"consolidation.writer": "register_consolidation"}
+
+
+# A snapshot this tool did not write, but fully re-planned against and found
+# nothing to change -- e.g. the last snapshot written by an older version of
+# this tool. Recorded so it is trusted from then on instead of re-planned on
+# every run.
+ADOPTED_SNAPSHOT_KEY = "consolidation.adopted-snapshot"
+
+
+def written_by_us(target_table) -> bool:
+    snap = target_table.current_snapshot()
+    if snap is None:
+        return True
+    if snap.summary.additional_properties.get("consolidation.writer") == WRITER_SUMMARY["consolidation.writer"]:
+        return True
+    return target_table.properties.get(ADOPTED_SNAPSHOT_KEY) == str(snap.snapshot_id)
+
+# Both records live in TABLE PROPERTIES, written in the same commit as the
+# data they describe (or on their own when a run has no data to commit, so an
+# up-to-date target still records that it is up to date). A snapshot-summary
+# record could only be written alongside new files.
+
+
+def recorded_source_snapshots(target_table) -> dict:
+    """{source namespace: source snapshot id} the target currently reflects.
+    Empty for a target written before this was recorded."""
+    out = {}
+    for k, v in target_table.properties.items():
+        if k.startswith(SOURCE_SNAPSHOT_PREFIX) and v not in ("", "None"):
+            out[k[len(SOURCE_SNAPSHOT_PREFIX):]] = int(v)
+    return out
+
+
+def registration_mode(cfg: dict) -> str:
+    return "self-contained" if cfg.get("self_contained_target") else "splice"
+
+
+def recorded_registration_mode(target_table):
+    """The mode the target was last registered under. None for a target
+    written before this was recorded, which never equals a real mode, so its
+    first run re-plans everything once."""
+    return target_table.properties.get(REGISTRATION_MODE_KEY)
+
+
+def registration_properties(source_snapshots: dict, cfg: dict) -> dict:
+    """Properties recording, for each source THIS run planned, the source
+    snapshot the target now reflects, plus the registration mode. Sources not
+    in this run keep their existing property untouched. Read by the next run
+    to skip unchanged sources, and by verify_consolidation.py to tell a
+    target that is merely BEHIND its source from one that is wrong."""
+    props = {f"{SOURCE_SNAPSHOT_PREFIX}{ns}": str(sid) for ns, sid in source_snapshots.items() if sid is not None}
+    props[REGISTRATION_MODE_KEY] = registration_mode(cfg)
+    return props
 
 
 def relabeled_path(target_location: str, source_id_column: str, ns: str, source_path: str) -> str:
@@ -742,7 +854,36 @@ def relabeled_data_file(src, dst_path: str, size: int, ns: str, id_map: dict, pr
     )
 
 
+DEFAULT_RELABEL_WORKERS = 32
+DEFAULT_RELABEL_COMMIT_BATCH = 500
+_relabel_pool_lock = threading.Lock()
+_relabel_pools: dict = {}
+_s3_clients: dict = {}
+
+
+def _relabel_pool(workers: int) -> ThreadPoolExecutor:
+    """The process-wide relabel thread pool for this size, created once.
+    Table threads submit to it and wait; relabel jobs never submit work of
+    their own, so sharing it cannot deadlock."""
+    with _relabel_pool_lock:
+        pool = _relabel_pools.get(workers)
+        if pool is None:
+            pool = _relabel_pools[workers] = ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="relabel"
+            )
+        return pool
+
+
 def _server_side_s3_client(workers: int):
+    """Cached per pool size: boto3 clients are thread-safe, and one client
+    with a connection pool sized to the relabel pool beats one per table."""
+    with _relabel_pool_lock:
+        if workers not in _s3_clients:
+            _s3_clients[workers] = _make_server_side_s3_client(workers)
+        return _s3_clients[workers]
+
+
+def _make_server_side_s3_client(workers: int):
     """A boto3 S3 client for server-side relabel copies, or None to copy
     through each table's own FileIO instead.
 
@@ -764,14 +905,44 @@ def _server_side_s3_client(workers: int):
     return boto3.client("s3", config=Config(max_pool_connections=max(10, workers * 2)))
 
 
+def cat_load_source(source_namespace: str, table_name: str):
+    """load_table for one source, on this thread's own catalog. Cheap (one
+    catalog call plus the metadata file) next to planning its files."""
+    return thread_catalog().load_table(f"{source_namespace}.{table_name}")
+
+
+def _snapshot_id(table):
+    snap = table.current_snapshot()
+    return snap.snapshot_id if snap is not None else None
+
+
+def _table_sources(cfg: dict, table_name: str) -> set:
+    """Which configured sources have this table. run() fills
+    cfg["_sources_by_table"] during discovery; a direct register_table()
+    call without it assumes every configured source does."""
+    by_table = cfg.get("_sources_by_table")
+    if by_table is None:
+        return set(cfg["source_namespaces"])
+    return by_table.get(table_name, set())
+
+
 def _load_source_files(source_namespace: str, table_name: str):
-    """Runs inside the source-level thread pool -- one (load_table +
-    plan_files) round trip per source, using this thread's own catalog."""
-    cat = thread_catalog()
-    src_table = cat.load_table(f"{source_namespace}.{table_name}")
+    """load_table + plan_files for one source (kept for callers outside
+    register_table)."""
+    return _plan_source_files(source_namespace, cat_load_source(source_namespace, table_name))
+
+
+def _plan_source_files(source_namespace: str, src_table):
+    """Runs inside the source-level thread pool: plan one source's files at
+    its current snapshot and return them with that snapshot's id."""
     src_schema = src_table.schema()
-    files = list(src_table.scan().plan_files())
-    return source_namespace, src_schema, files
+    snap = src_table.current_snapshot()
+    snapshot_id = snap.snapshot_id if snap is not None else None
+    # Plan against the snapshot we record, so the recorded id describes
+    # exactly the file list this run registered (a writer commit landing
+    # between the two calls can't make them disagree).
+    files = list(src_table.scan(snapshot_id=snapshot_id).plan_files()) if snapshot_id is not None else []
+    return source_namespace, src_schema, files, snapshot_id
 
 
 def find_field_id_disagreements(schemas_by_source: dict) -> list:
@@ -916,12 +1087,88 @@ def promote_target_types_to_widest(cat, target_table, target_id, schemas_by_sour
     return cat.load_table(target_id)
 
 
+DEFAULT_CLEANUP_GRACE_MINUTES = 24 * 60
+
+
+def cleanup_target(cat, target_id: str, cfg: dict) -> tuple:
+    """Expire target snapshots older than the grace window, then delete the
+    data files ONLY those snapshots referenced -- retired relabeled copies
+    (and files from the old rewrite path) under the target's own location.
+    Returns (snapshots expired, files deleted).
+
+    Why: a retirement only removes a file from the CURRENT snapshot. Without
+    this, every relabeled copy the writer's copy-on-write ever replaced stays
+    in S3 forever, and every run's snapshot accumulates in the target's
+    metadata. On a customer's prod sample the writer replaced ~311 GB of
+    files a day across six tables, so retired copies grow at about that rate.
+
+    Safety:
+      * Only files under the target's own location are ever deleted. A
+        spliced reference points at a SOURCE's file, which the writer owns;
+        it is never touched.
+      * A file still referenced by any snapshot that is kept is never
+        deleted.
+      * The grace window must outlast the slowest reader's refresh: a reader
+        still planning against an expired snapshot fails with "file
+        inaccessible". Snowflake catalog integrations poll on
+        REFRESH_INTERVAL_SECONDS (one we use is 10,000 s, ~2.8 h), so the
+        default is a conservative 24 h.
+      * The metadata commit happens BEFORE any delete: if it fails, nothing
+        is deleted.
+    Set cleanup_grace_minutes: 0 to turn cleanup off."""
+    grace = cfg.get("cleanup_grace_minutes", DEFAULT_CLEANUP_GRACE_MINUTES)
+    if not grace:
+        return 0, 0
+    tbl = cat.load_table(target_id)
+    current = tbl.current_snapshot()
+    if current is None:
+        return 0, 0
+    cutoff_ms = int((time.time() - grace * 60) * 1000)
+    expiring = [s for s in tbl.metadata.snapshots if s.timestamp_ms < cutoff_ms and s.snapshot_id != current.snapshot_id]
+    if not expiring:
+        return 0, 0
+    expiring_ids = {s.snapshot_id for s in expiring}
+    kept = [s for s in tbl.metadata.snapshots if s.snapshot_id not in expiring_ids]
+
+    def files_of(snaps) -> set:
+        manifests = {m.manifest_path: m for s in snaps for m in s.manifests(tbl.io)}
+        return {
+            e.data_file.file_path
+            for m in manifests.values()
+            for e in m.fetch_manifest_entry(tbl.io, discard_deleted=True)
+        }
+
+    location = tbl.metadata.location.rstrip("/") + "/"
+    doomed = sorted(p for p in files_of(expiring) - files_of(kept) if p.startswith(location))
+
+    es = tbl.maintenance.expire_snapshots()
+    # pyiceberg 0.10 declares this as a CLASS attribute (`= set()`), so ids
+    # would leak between ExpireSnapshots instances; give this one its own.
+    es._snapshot_ids_to_expire = set()
+    es.by_ids(sorted(expiring_ids)).commit()
+
+    def _delete(path):
+        tbl.io.delete(path)
+
+    workers = cfg.get("relabel_workers", DEFAULT_RELABEL_WORKERS)
+    if doomed:
+        list(_relabel_pool(workers).map(_delete, doomed))
+    return len(expiring_ids), len(doomed)
+
+
+def _log_cleanup(table_name: str, expired: int, deleted: int) -> None:
+    if expired or deleted:
+        logger.info(
+            "  [%s] cleanup: %d target snapshot(s) past the grace window expired, %d retired file(s) deleted",
+            table_name, expired, deleted,
+        )
+
+
 def register_table(table_name: str, cfg: dict) -> tuple:
     """Runs inside the table-level thread pool (or serially if called
     directly) -- one call registers one target table end to end, using its
     own catalog via thread_catalog(), so this is safe to call concurrently
     for different table_name values from different threads."""
-    source_namespaces = cfg["source_namespaces"]
     target_namespace = cfg["target_namespace"]
     source_id_column = cfg["source_id_column"]
     source_workers = cfg["source_workers"]
@@ -929,17 +1176,65 @@ def register_table(table_name: str, cfg: dict) -> tuple:
     cat = thread_catalog()
     t_start = time.time()
     logger.info("=== %s ===", table_name)
+    target_id = f"{target_namespace}.{table_name}"
 
-    # Load every source's schema + file list FIRST, before creating or
+    # Which sources does this run look at? (a) cfg["only_sources"] narrows the
+    # run to the sources an event says changed (--sources); (b) of those,
+    # any whose current snapshot is the one the target already reflects is
+    # skipped -- no manifest reads, no planning. Leaving a source out is safe
+    # by construction: every step below is per source, and every decision an
+    # earlier run made (which name owns a field id, widened types, relabel
+    # ids) lives in the target's schema, not in this run's view. Measured on
+    # a customer refresh: 106 of 138 tables were unchanged and still cost a
+    # median 9.7 s each re-planning all 6 sources; at hundreds of sources that
+    # grows linearly. cfg["full_refresh"] turns the skip off.
+    configured = [ns for ns in cfg["source_namespaces"] if ns in _table_sources(cfg, table_name)]
+    only = cfg.get("only_sources")
+    candidates = [ns for ns in configured if not only or ns in only]
+    if not candidates:
+        logger.info("  [%s] no selected source has this table, nothing to do", table_name)
+        return table_name, 0, 0, 0, 0, time.time() - t_start
+
+    target_exists = cat.table_exists(target_id)
+    existing_target = cat.load_table(target_id) if target_exists else None
+    recorded = recorded_source_snapshots(existing_target) if target_exists else {}
+    # A change to HOW files are registered invalidates every recorded
+    # snapshot: switching self_contained_target on must convert sources that
+    # haven't changed at all. The mode is recorded next to the snapshots.
+    mode_changed = target_exists and recorded_registration_mode(existing_target) != registration_mode(cfg)
+    if mode_changed:
+        logger.info("  [%s] registration mode changed since the last run, re-planning every source", table_name)
+    elif target_exists and not written_by_us(existing_target):
+        mode_changed = True
+        logger.info("  [%s] target was last written by something other than this tool, re-planning every source", table_name)
+
+    with ThreadPoolExecutor(max_workers=min(source_workers, len(candidates))) as ex:
+        loaded = dict(ex.map(lambda ns: (ns, cat_load_source(ns, table_name)), candidates))
+    source_namespaces = [
+        ns for ns in candidates
+        if cfg.get("full_refresh") or mode_changed or not target_exists
+        or recorded.get(ns) != _snapshot_id(loaded[ns])
+    ]
+    unchanged = len(candidates) - len(source_namespaces)
+    if not source_namespaces:
+        logger.info("  [%s] all %d source(s) unchanged since the last run, skipped", table_name, unchanged)
+        _log_cleanup(table_name, *cleanup_target(cat, target_id, cfg))
+        return table_name, 0, 0, 0, 0, time.time() - t_start
+    if unchanged:
+        logger.info("  [%s] %d of %d source(s) unchanged since the last run, skipped", table_name, unchanged, len(candidates))
+
+    # Load every active source's schema + file list FIRST, before creating or
     # touching anything, so a source-disagreement abort leaves no trace.
     # (This used to happen after target creation; the reorder is what makes
     # the check below a true pre-flight.)
     files_by_source = {}
+    source_snapshots = {}  # {ns: snapshot id this run planned against}
     with ThreadPoolExecutor(max_workers=min(source_workers, len(source_namespaces))) as ex:
-        futs = {ex.submit(_load_source_files, ns, table_name): ns for ns in source_namespaces}
+        futs = {ex.submit(_plan_source_files, ns, loaded[ns]): ns for ns in source_namespaces}
         for fut in as_completed(futs):
-            ns, src_schema, files = fut.result()
+            ns, src_schema, files, snapshot_id = fut.result()
             files_by_source[ns] = (src_schema, files)
+            source_snapshots[ns] = snapshot_id
 
     # PRE-FLIGHT: do the sources actually agree on what each field id means?
     # Splicing by reference is only safe if they do -- see
@@ -1026,9 +1321,8 @@ def register_table(table_name: str, cfg: dict) -> tuple:
 
     source_schema = files_by_source[source_namespaces[0]][0]
 
-    target_id = f"{target_namespace}.{table_name}"
     ensure_namespace(cat, target_namespace)
-    if cat.table_exists(target_id):
+    if target_exists:
         target_table = cat.load_table(target_id)
         logger.info("  [%s] target table already exists, reusing", table_name)
     else:
@@ -1059,7 +1353,7 @@ def register_table(table_name: str, cfg: dict) -> tuple:
     known_field_names = {f.field_id: f.name for f in target_table.schema().fields}
 
     already_by_source, spliced_by_source, relabeled_by_source, legacy_by_source = already_registered_by_source(
-        target_table
+        target_table, source_id_column, source_namespaces
     )
     already = {p for paths in already_by_source.values() for p in paths}
 
@@ -1313,9 +1607,11 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         )
 
     relabeled_files = []
+    committed_early = []  # relabeled copies already committed in a batch (see below)
     if relabel_jobs:
         src_ios = {ns: cat.load_table(f"{ns}.{table_name}").io for ns in {job[0] for job in relabel_jobs}}
-        s3 = _server_side_s3_client(source_workers)
+        relabel_workers = cfg.get("relabel_workers", DEFAULT_RELABEL_WORKERS)
+        s3 = _server_side_s3_client(relabel_workers)
 
         def _relabel(job):
             ns, src_df, dst, id_map, promoted = job
@@ -1325,8 +1621,44 @@ def register_table(table_name: str, cfg: dict) -> tuple:
                 size = parquet_footer.relabel_via_fileio(src_ios[ns], target_table.io, src_df.file_path, dst, id_map)
             return relabeled_data_file(src_df, dst, size, ns, id_map, promoted, spec_id)
 
-        with ThreadPoolExecutor(max_workers=source_workers) as ex:
-            relabeled_files = list(ex.map(_relabel, relabel_jobs))
+        # One pool shared by every table in the run, sized by relabel_workers,
+        # not source_workers. Each copy is ~1.5 s of S3 round trips (footer
+        # read, multipart create, server-side part copy, footer upload,
+        # complete) whatever the file size, so a table's relabel time is
+        # files / workers. Measured on a customer run: 5,373 files on 6
+        # threads took 26 min. Sharing the pool caps total S3 concurrency at
+        # relabel_workers no matter how many tables run at once.
+        pool = _relabel_pool(relabel_workers)
+
+        # Large ADD-ONLY relabels (an initial load) are committed in batches,
+        # so a crash 25 minutes in loses one batch, not the run: committed
+        # copies are in the target's manifest and the rerun skips them. Only
+        # when nothing is being retired -- a retirement must land in the same
+        # commit as its replacement, or readers would briefly see rows missing
+        # or doubled. Intermediate commits leave the source-snapshot record
+        # alone; only the final commit claims the new snapshots, so an
+        # interrupted load is re-planned next run and verify reports it as
+        # LAG rather than as current.
+        batch = int(cfg.get("relabel_commit_batch", DEFAULT_RELABEL_COMMIT_BATCH) or 0)
+        pending_retirements = orphaned_files or relabel_orphans or legacy_retired
+        if batch and not pending_retirements and len(relabel_jobs) > batch:
+            chunks = [relabel_jobs[i:i + batch] for i in range(0, len(relabel_jobs), batch)]
+            for n, chunk in enumerate(chunks[:-1], start=1):
+                done = list(pool.map(_relabel, chunk))
+                with target_table.transaction() as txn:
+                    with txn._append_snapshot_producer(dict(WRITER_SUMMARY)) as fa:
+                        for df in done:
+                            fa.append_data_file(df)
+                target_table = cat.load_table(target_id)
+                relabeled_files.extend(done)
+                committed_early.extend(done)
+                logger.info(
+                    "  [%s] relabel batch %d/%d committed (%d file(s), %d/%d so far)",
+                    table_name, n, len(chunks), len(done), len(relabeled_files), len(relabel_jobs),
+                )
+            relabeled_files.extend(pool.map(_relabel, chunks[-1]))
+        else:
+            relabeled_files = list(pool.map(_relabel, relabel_jobs))
 
         for ns in sorted({job[0] for job in relabel_jobs}):
             mine = [df for df in relabeled_files if df.partition[0] == ns]
@@ -1349,10 +1681,13 @@ def register_table(table_name: str, cfg: dict) -> tuple:
     #    cheaper fast-append path is used. Either way readers see the whole
     #    refresh or none of it.
     to_delete = orphaned_files + relabel_orphans + legacy_retired
-    to_add = new_files + relabeled_files
+    early = {df.file_path for df in committed_early}
+    to_add = new_files + [df for df in relabeled_files if df.file_path not in early]
+    record = registration_properties(source_snapshots, cfg)
     if to_delete:
         with target_table.transaction() as txn:
-            with txn.update_snapshot({}).overwrite() as ov:
+            txn.set_properties(record)
+            with txn.update_snapshot(dict(WRITER_SUMMARY)).overwrite() as ov:
                 for df in to_delete:
                     ov.delete_data_file(df)
                 for df in to_add:
@@ -1360,10 +1695,25 @@ def register_table(table_name: str, cfg: dict) -> tuple:
         target_table = cat.load_table(target_id)
     elif to_add:
         with target_table.transaction() as txn:
-            with txn._append_snapshot_producer({}) as append_files:
+            txn.set_properties(record)
+            with txn._append_snapshot_producer(dict(WRITER_SUMMARY)) as append_files:
                 for df in to_add:
                     append_files.append_data_file(df)
         target_table = cat.load_table(target_id)
+    else:
+        # Nothing to register, but the target is now known to be current at
+        # these source snapshots -- record it so the next run can skip them,
+        # and adopt the current target snapshot if this tool didn't write it.
+        # Only a run that re-planned EVERY source with this table may vouch
+        # for the whole target; a --sources run checked just some of them.
+        if not written_by_us(target_table) and set(source_namespaces) == set(configured):
+            record[ADOPTED_SNAPSHOT_KEY] = str(target_table.current_snapshot().snapshot_id)
+    if not (to_delete or to_add) and any(target_table.properties.get(k) != v for k, v in record.items()):
+        with target_table.transaction() as txn:
+            txn.set_properties(record)
+        target_table = cat.load_table(target_id)
+
+    _log_cleanup(table_name, *cleanup_target(cat, target_id, cfg))
 
     relabeled_rows = sum(df.record_count for df in relabeled_files)
     retired = len(to_delete)
@@ -1405,19 +1755,21 @@ def run(cfg: dict, tables: list = None) -> dict:
     t_run_start = time.time()
     driver_cat = get_catalog()
     cfg["source_namespaces"] = resolve_source_namespaces(driver_cat, cfg)
-    tables = tables or discover_common_tables(driver_cat, cfg["source_namespaces"])
+    by_table = discover_tables(driver_cat, cfg["source_namespaces"], cfg.get("source_workers", 8))
+    cfg["_sources_by_table"] = by_table
+    tables = tables or sorted(by_table)
     if not tables:
-        raise SystemExit(
-            "No tables to register (no table name is common to every configured source namespace)."
-        )
+        raise SystemExit("No tables to register (no configured source namespace has any table).")
 
     logger.info(
-        "Registering %d table(s) across %d source namespace(s) into '%s', table_workers=%d, source_workers=%d",
+        "Registering %d table(s) across %d source namespace(s) into '%s', table_workers=%d, "
+        "source_workers=%d, relabel_workers=%d",
         len(tables),
         len(cfg["source_namespaces"]),
         cfg["target_namespace"],
         cfg["table_workers"],
         cfg["source_workers"],
+        cfg.get("relabel_workers", DEFAULT_RELABEL_WORKERS),
     )
 
     grand_spliced, grand_relabeled = 0, 0
@@ -1465,7 +1817,17 @@ def main():
     parser.add_argument(
         "tables",
         nargs="*",
-        help="Optional: restrict to these table names instead of auto-discovering common tables",
+        help="Optional: restrict to these table names instead of auto-discovering tables",
+    )
+    parser.add_argument(
+        "--sources",
+        help="Comma-separated source namespaces to process this run (e.g. the tenant an event says "
+        "changed). Other sources' registered files are left exactly as they are.",
+    )
+    parser.add_argument(
+        "--full-refresh",
+        action="store_true",
+        help="Re-plan every source even if its snapshot is unchanged since the last run",
     )
     args = parser.parse_args()
 
@@ -1506,6 +1868,10 @@ def main():
             )
 
     cfg = load_config(args.config)
+    if args.sources:
+        cfg["only_sources"] = {ns.strip() for ns in args.sources.split(",") if ns.strip()}
+    if args.full_refresh:
+        cfg["full_refresh"] = True
     summary = run(cfg, tables=args.tables or None)
 
     print("\n=== SUMMARY ===")

@@ -107,6 +107,9 @@ def build_config_from_env() -> dict:
         "source_id_column": source_id_column,
         "table_workers": int(os.environ.get("TABLE_WORKERS", "8")),
         "source_workers": int(os.environ.get("SOURCE_WORKERS", "8")),
+        "relabel_workers": int(os.environ.get("RELABEL_WORKERS", "32")),
+        "relabel_commit_batch": int(os.environ.get("RELABEL_COMMIT_BATCH", "500")),
+        "cleanup_grace_minutes": int(os.environ.get("CLEANUP_GRACE_MINUTES", "1440")),
         "self_contained_target": os.environ.get("SELF_CONTAINED_TARGET", "false").strip().lower() == "true",
     }
 
@@ -134,10 +137,20 @@ def handler(event, context):
     invoke, you can pass {"tables": ["orders", "customers"]} to restrict a
     single run to just those table names, mirroring the CLI's optional
     positional `tables` arguments.
+
+    For an event-driven, per-table drain, also pass {"sources": [...]}: only
+    those source namespaces are planned (the CLI's --sources), so the cost of
+    a run tracks what changed, not how many tenants there are. Sources whose
+    snapshot is unchanged are skipped regardless; {"full_refresh": true}
+    turns that off.
     """
     event = event or {}
     cfg = build_config_from_env()
     tables = event.get("tables") or None
+    if event.get("sources"):
+        cfg["only_sources"] = set(event["sources"])
+    if event.get("full_refresh"):
+        cfg["full_refresh"] = True
 
     # cfg has EITHER 'source_namespaces' (explicit) OR
     # 'source_namespace_pattern' (resolved against the live catalog inside

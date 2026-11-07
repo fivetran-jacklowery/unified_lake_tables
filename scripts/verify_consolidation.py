@@ -6,10 +6,14 @@ Three checks, each re-derived independently rather than trusting the
 registration script's own bookkeeping, so a bug in register_consolidation.py
 wouldn't hide itself here:
 
-  1. Row counts. For every configured source namespace, the number of
-     materialized rows readable in the target table for that source's
-     identity-partition value must equal the number of rows an independent
-     scan of the source table itself returns. This is the same class of
+  1. Row counts. For every configured source namespace, the rows readable
+     in the target for that source's identity-partition value must equal
+     (a) the row counts the target's own manifest records for it -- else the
+     data is unreadable or mis-registered -- and (b) the source's row count,
+     judged at the source snapshot the target recorded at registration: if
+     the source has moved on since, the difference is reported as LAG, not
+     as a failure. Counting streams one column batch by batch, so memory
+     stays flat however large the table is. This is the same class of
      check that caught a real bug during internal validation: an early,
      non-idempotent version of this technique silently doubled every row on
      a second run, and it was caught by exactly this kind of count
@@ -34,13 +38,14 @@ was supposed to do, not that your source data itself is drift-free in ways
 this tool was never designed to detect (renames, type changes, deletes).
 
 Usage:
-    python scripts/verify_consolidation.py [--config config.yaml] [tables...]
+    python scripts/verify_consolidation.py [--config config.yaml] [--workers 4] [tables...]
 """
 import argparse
 import logging
 import os
 import sys
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 
@@ -50,10 +55,12 @@ from dotenv import load_dotenv
 # source tables.
 from register_consolidation import (
     catalog_backend,
-    discover_common_tables,
+    discover_tables,
     get_catalog,
     load_config,
+    recorded_source_snapshots,
     resolve_source_namespaces,
+    thread_catalog,
 )
 from pyiceberg.catalog import Catalog  # noqa: F401  (re-exported for callers' type hints)
 
@@ -77,6 +84,52 @@ logger = logging.getLogger("verify_consolidation")
 # Don't reintroduce a local catalog constructor here.
 
 
+COUNT_COLUMN_PREFERENCE = ("_fivetran_synced",)
+
+
+def _count_column(src_schema, target_schema, source_id_column: str) -> str:
+    """One real column present in both the source and the target: reading it
+    forces every data file open (so an unreadable file still fails), while
+    holding only one column of one batch in memory at a time."""
+    target_names = {f.name for f in target_schema.fields} - {source_id_column}
+    for name in COUNT_COLUMN_PREFERENCE:
+        if name in target_names and src_schema.find_field(name, case_sensitive=False) is not None:
+            return name
+    for f in src_schema.fields:
+        if f.name in target_names:
+            return f.name
+    raise ValueError("source and target share no column to count by")
+
+
+def streamed_row_count(table, column: str, row_filter=None, filter_column: str = None) -> int:
+    """Row count by streaming ONE column batch by batch. The old check called
+    scan().to_arrow().num_rows, materializing every column of the whole table
+    -- 7 minutes for one 5.3M-row tenant, and an out-of-memory kill (exit 137)
+    on a customer's larger tables.
+
+    filter_column MUST be passed when row_filter references a column other
+    than `column`: pyiceberg 0.10 silently returns ZERO rows when a scan
+    filters on an identity-partition column that is not in selected_fields.
+    It costs nothing here -- the partition value is a constant filled in from
+    metadata, not read from the files."""
+    if row_filter is None:
+        scan = table.scan(selected_fields=(column,))
+    else:
+        fields = (column,) if filter_column in (None, column) else (column, filter_column)
+        scan = table.scan(row_filter=row_filter, selected_fields=fields)
+    return sum(batch.num_rows for batch in scan.to_arrow_batch_reader())
+
+
+def _manifest_rows(tasks) -> tuple:
+    """(rows per the manifests, whether any task carries delete files). With
+    delete files, record counts overstate live rows and can't be trusted."""
+    rows, has_deletes = 0, False
+    for t in tasks:
+        rows += t.file.record_count
+        has_deletes = has_deletes or bool(t.delete_files)
+    return rows, has_deletes
+
+
 def verify_table(cat, table_name: str, source_namespaces: list, target_namespace: str, source_id_column: str) -> bool:
     target_id = f"{target_namespace}.{table_name}"
     ok = True
@@ -86,8 +139,18 @@ def verify_table(cat, table_name: str, source_namespaces: list, target_namespace
         return False
 
     target_table = cat.load_table(target_id)
+    recorded = recorded_source_snapshots(target_table)
 
-    # --- Check 1: row counts, per source, independently re-derived ---
+    # --- Check 1: row counts, per source ---
+    # Two comparisons, so "behind" and "wrong" are told apart:
+    #   a. target vs ITSELF: rows actually readable for a source must equal the
+    #      row counts the target's manifest claims for it. A mismatch means
+    #      unreadable or mis-registered files -- always an error.
+    #   b. target vs SOURCE: only meaningful at the source snapshot the target
+    #      recorded at registration. If the source has moved on since, the
+    #      difference is expected LAG (re-run registration), not an error. A
+    #      target written before snapshots were recorded falls back to
+    #      comparing against the source's current state.
     total_target_rows = 0
     sources_checked = 0
     for ns in source_namespaces:
@@ -97,7 +160,8 @@ def verify_table(cat, table_name: str, source_namespaces: list, target_namespace
             continue
         sources_checked += 1
         src_table = cat.load_table(src_id)
-        source_row_count = src_table.scan().to_arrow().num_rows
+        column = _count_column(src_table.schema(), target_table.schema(), source_id_column)
+        row_filter = f"{source_id_column} = '{ns}'"
 
         # Same cross-namespace credential gap register_consolidation.py's
         # idempotency check has (see multi_source_io.py's docstring): these
@@ -107,21 +171,46 @@ def verify_table(cat, table_name: str, source_namespaces: list, target_namespace
         original_io = target_table.io
         target_table.io = MultiSourceFileIO([target_table.io, src_table.io])
         try:
-            target_row_count = target_table.scan(row_filter=f"{source_id_column} = '{ns}'").to_arrow().num_rows
+            registered_rows, _ = _manifest_rows(target_table.scan(row_filter=row_filter).plan_files())
+            target_row_count = streamed_row_count(target_table, column, row_filter, source_id_column)
         finally:
             target_table.io = original_io
         total_target_rows += target_row_count
-        if source_row_count != target_row_count:
+
+        if target_row_count != registered_rows:
             logger.error(
-                "[%s] ROW COUNT MISMATCH for source '%s': source has %d row(s), target has %d row(s) for that source",
-                table_name,
-                ns,
-                source_row_count,
-                target_row_count,
+                "[%s] UNREADABLE/MIS-REGISTERED DATA for source '%s': target manifest records %d row(s), "
+                "but its files hold %d",
+                table_name, ns, registered_rows, target_row_count,
             )
             ok = False
-        else:
+            continue
+
+        snap = src_table.current_snapshot()
+        current_sid = snap.snapshot_id if snap is not None else None
+        recorded_sid = recorded.get(ns)
+        src_tasks = list(src_table.scan().plan_files()) if current_sid is not None else []
+        source_row_count, has_deletes = _manifest_rows(src_tasks)
+        if has_deletes:  # merge-on-read source: count what is actually live
+            source_row_count = streamed_row_count(src_table, column)
+
+        if source_row_count == target_row_count:
             logger.info("[%s] %s: %d row(s), matches source", table_name, ns, target_row_count)
+        elif recorded_sid is not None and recorded_sid != current_sid:
+            logger.warning(
+                "[%s] LAG for source '%s': target reflects source snapshot %d (%d row(s)); the source has "
+                "moved on to snapshot %s (%d row(s)). Expected between runs -- re-run registration to catch up.",
+                table_name, ns, recorded_sid, target_row_count, current_sid, source_row_count,
+            )
+        else:
+            logger.error(
+                "[%s] ROW COUNT MISMATCH for source '%s': source has %d row(s), target has %d row(s) for that "
+                "source%s",
+                table_name, ns, source_row_count, target_row_count,
+                "" if recorded_sid is not None else
+                " (target predates snapshot tracking, so this may also be lag -- re-run registration, then verify)",
+            )
+            ok = False
 
     if sources_checked == 0:
         logger.error("[%s] none of the configured source namespaces have this table -- nothing to verify", table_name)
@@ -166,6 +255,7 @@ def verify_table(cat, table_name: str, source_namespaces: list, target_namespace
 def main():
     parser = argparse.ArgumentParser(description="Sanity-check tables produced by register_consolidation.py.")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml (default: ./config.yaml)")
+    parser.add_argument("--workers", type=int, default=4, help="Tables verified concurrently (default 4)")
     parser.add_argument("tables", nargs="*", help="Optional: restrict to these table names")
     args = parser.parse_args()
 
@@ -177,16 +267,19 @@ def main():
     # glob (see config.example.yaml); this normalizes to a concrete list
     # either way, so everything below can stay unaware of which one was set.
     cfg["source_namespaces"] = resolve_source_namespaces(cat, cfg)
-    tables = args.tables or discover_common_tables(cat, cfg["source_namespaces"])
+    by_table = discover_tables(cat, cfg["source_namespaces"])
+    tables = args.tables or sorted(by_table)
     if not tables:
         logger.error("No tables to verify.")
         sys.exit(1)
 
-    all_ok = True
-    for t in tables:
+    def _one(t):
         logger.info("=== verifying %s ===", t)
-        if not verify_table(cat, t, cfg["source_namespaces"], cfg["target_namespace"], cfg["source_id_column"]):
-            all_ok = False
+        sources = [ns for ns in cfg["source_namespaces"] if ns in by_table.get(t, ())]
+        return verify_table(thread_catalog(), t, sources, cfg["target_namespace"], cfg["source_id_column"])
+
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+        all_ok = all(list(ex.map(_one, tables)))
 
     if not all_ok:
         logger.error("One or more checks FAILED. See above.")
