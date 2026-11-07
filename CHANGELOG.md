@@ -22,6 +22,10 @@ Findings that shaped it:
   is read back and checked.
 * The Fivetran writer continued incrementally into the re-created table
   (three copy-on-write syncs, live) and kept the new ids.
+* On AWS Glue, apply / rollback / re-apply / consolidation pass the live
+  test (`tests/test_glue_live.py`, now 19 checks, which also covers the
+  scale fixes: properties as the run record, skip-unchanged, S3 cleanup).
+  The Fivetran writer on Glue after a swap is still untested.
 * A Snowflake Iceberg table on the source stops auto-refreshing when the
   UUID changes (GENERALIZED_PIPE_STOPPED) and must be re-created; a
   catalog-linked database re-links by itself.

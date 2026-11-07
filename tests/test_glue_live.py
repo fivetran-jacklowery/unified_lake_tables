@@ -217,6 +217,71 @@ try:
     check("verify_consolidation passes",
           vc.verify_table(cat, "widgets", [DB_A, DB_B], DB_T, "source_connection_id"))
 
+    print("\n=== skip unchanged sources (record kept in Glue table properties) ===")
+    planned = []
+    real_plan = rc._plan_source_files
+    rc._plan_source_files = lambda ns, t: (planned.append(ns), real_plan(ns, t))[1]
+    try:
+        rc.run(cfg, tables=["widgets"])
+    finally:
+        rc._plan_source_files = real_plan
+    recorded = rc.recorded_source_snapshots(cat.load_table(f"{DB_T}.widgets"))
+    check("source snapshots recorded as Glue table properties", set(recorded) == {DB_A, DB_B}, str(recorded))
+    check("an unchanged run plans no source", planned == [], str(planned))
+
+    print("\n=== copy-on-write refresh + cleanup deletes the retired S3 copy ===")
+    old_copy = [t.file.file_path for t in cat.load_table(f"{DB_T}.widgets").scan().plan_files()
+                if "/relabeled/" in t.file.file_path]
+    cat.load_table(f"{DB_B}.widgets").delete("amount < 1002")  # writer-style copy-on-write
+    rc.run(cfg, tables=["widgets"])
+    time.sleep(1)
+    expired, deleted = rc.cleanup_target(cat, f"{DB_T}.widgets",
+                                         {"cleanup_grace_minutes": 0.001, "cleanup_interval_minutes": 0})
+    bucket_key = old_copy[0][len("s3://"):].split("/", 1) if old_copy else [BUCKET, ""]
+    gone = False
+    try:
+        s3.head_object(Bucket=bucket_key[0], Key=bucket_key[1])
+    except Exception:  # noqa: BLE001
+        gone = True
+    check("cleanup expired snapshots and deleted the retired relabeled copy from S3",
+          expired >= 1 and deleted >= 1 and gone, f"expired={expired} deleted={deleted} gone={gone}")
+    a_files = [t.file.file_path for t in cat.load_table(f"{DB_A}.widgets").scan().plan_files()]
+    a_intact = all(s3.head_object(Bucket=x[len("s3://"):].split("/", 1)[0],
+                                  Key=x[len("s3://"):].split("/", 1)[1]) for x in a_files)
+    check("cleanup left source files alone", a_intact)
+    check("verify still passes after refresh + cleanup",
+          vc.verify_table(cat, "widgets", [DB_A, DB_B], DB_T, "source_connection_id"))
+
+    print("\n=== EXPERIMENTAL realign_source_field_ids.py on Glue ===")
+    import realign_source_field_ids as rs
+    import tempfile
+
+    rec_dir = tempfile.mkdtemp(prefix="realign-glue-")
+    ref = rs.reference_schema(cat, cfg, "widgets")
+    before_rows = sorted(cat.load_table(f"{DB_B}.widgets").scan().to_arrow().select(
+        ["rowkey", "amount", "flag", "status"]).to_pylist(), key=lambda r: r["rowkey"])
+    record = rs.apply_one(cat, cfg, rs.plan_one(cat, cfg, DB_B, "widgets", ref), "widgets", rec_dir)
+    ids_b = {f.name: f.field_id for f in cat.load_table(f"{DB_B}.widgets").schema().fields}
+    ids_t = {f.name: f.field_id for f in cat.load_table(f"{DB_T}.widgets").schema().fields}
+    check("realign: source ids now match the target", all(ids_t[n] == i for n, i in ids_b.items()), str(ids_b))
+    after_rows = sorted(cat.load_table(f"{DB_B}.widgets").scan().to_arrow().select(
+        ["rowkey", "amount", "flag", "status"]).to_pylist(), key=lambda r: r["rowkey"])
+    check("realign: values unchanged", after_rows == before_rows)
+
+    rs.rollback(cat, record)
+    ids_back = {f.name: f.field_id for f in cat.load_table(f"{DB_B}.widgets").schema().fields}
+    check("realign rollback restores the original layout on Glue",
+          ids_back == {"status": 1, "flag": 2, "rowkey": 3, "amount": 4}, str(ids_back))
+
+    rs.apply_one(cat, cfg, rs.plan_one(cat, cfg, DB_B, "widgets", ref), "widgets", rec_dir)
+    r = rc.run(cfg, tables=["widgets"])
+    b_paths = [t.file.file_path for t in cat.load_table(f"{DB_T}.widgets").scan(
+        row_filter=f"source_connection_id = '{DB_B}'").plan_files()]
+    check("after realign, consolidation splices the source (no relabeled copies)",
+          r["total_relabeled"] == 0 and b_paths and not any("/relabeled/" in x for x in b_paths), str(b_paths))
+    check("verify passes after realign",
+          vc.verify_table(cat, "widgets", [DB_A, DB_B], DB_T, "source_connection_id"))
+
 except Exception:  # noqa: BLE001
     traceback.print_exc()
     results.append(("harness did not raise", False, "see traceback"))

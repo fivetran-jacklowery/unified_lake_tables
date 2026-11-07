@@ -251,7 +251,9 @@ then on the source is spliced by reference with no copies.
 **Tested** on Polaris with a Connector SDK source: after the swap, three
 copy-on-write syncs ran with no resync, the writer kept the new ids, values
 matched row for row, and pyiceberg, DuckDB and Snowflake all read it
-correctly. **Not tested:** AWS Glue as the catalog, database connectors such
+correctly. On AWS Glue, the catalog side (apply, rollback, re-apply,
+consolidation) passes `tests/test_glue_live.py`. **Not tested:** the Fivetran
+writer continuing into a re-created table on Glue, database connectors such
 as SQL Server, a column added at the source after the swap, very large
 tables.
 

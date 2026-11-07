@@ -32,8 +32,11 @@ Tested, Polaris (Fivetran MDLS), Connector SDK source, 100k-row table:
     log, the writer never re-created its own table;
   * reads from pyiceberg, DuckDB and Snowflake matched afterwards;
   * consolidation then spliced the source with zero relabel copies.
+Tested, AWS Glue (tests/test_glue_live.py): apply, value check, rollback,
+re-apply and consolidation, on tables written by pyiceberg.
 NOT tested:
-  * AWS Glue as the catalog;
+  * the Fivetran writer continuing into a re-created table on GLUE (only on
+    Polaris);
   * database connectors (e.g. SQL Server) -- only the Connector SDK writer;
   * a source column added AFTER the swap;
   * large tables (many files): the connector stays paused for the copy;
