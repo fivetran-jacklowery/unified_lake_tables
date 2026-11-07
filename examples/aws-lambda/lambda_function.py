@@ -110,6 +110,7 @@ def build_config_from_env() -> dict:
         "relabel_workers": int(os.environ.get("RELABEL_WORKERS", "32")),
         "relabel_commit_batch": int(os.environ.get("RELABEL_COMMIT_BATCH", "500")),
         "cleanup_grace_minutes": int(os.environ.get("CLEANUP_GRACE_MINUTES", "1440")),
+        "cleanup_interval_minutes": int(os.environ.get("CLEANUP_INTERVAL_MINUTES", "60")),
         "self_contained_target": os.environ.get("SELF_CONTAINED_TARGET", "false").strip().lower() == "true",
     }
 

@@ -219,6 +219,7 @@ def load_config(path: str) -> dict:
     cfg.setdefault("relabel_workers", DEFAULT_RELABEL_WORKERS)
     cfg.setdefault("relabel_commit_batch", DEFAULT_RELABEL_COMMIT_BATCH)
     cfg.setdefault("cleanup_grace_minutes", DEFAULT_CLEANUP_GRACE_MINUTES)
+    cfg.setdefault("cleanup_interval_minutes", DEFAULT_CLEANUP_INTERVAL_MINUTES)
     cfg.setdefault("self_contained_target", False)
     return cfg
 
@@ -1088,6 +1089,7 @@ def promote_target_types_to_widest(cat, target_table, target_id, schemas_by_sour
 
 
 DEFAULT_CLEANUP_GRACE_MINUTES = 24 * 60
+DEFAULT_CLEANUP_INTERVAL_MINUTES = 60
 
 
 def cleanup_target(cat, target_id: str, cfg: dict) -> tuple:
@@ -1127,16 +1129,32 @@ def cleanup_target(cat, target_id: str, cfg: dict) -> tuple:
     expiring = [s for s in tbl.metadata.snapshots if s.timestamp_ms < cutoff_ms and s.snapshot_id != current.snapshot_id]
     if not expiring:
         return 0, 0
+    # Throttle. Finding what is safe to delete means reading every KEPT
+    # snapshot's manifests -- with event-driven drains every minute, ~1,440
+    # snapshots per table inside a 24 h window. Doing that on every drain
+    # would cost more than the drain. Only run once the oldest expirable
+    # snapshot is a full interval past the grace window, so cleanup runs
+    # about once per interval per table and expires an interval's worth.
+    interval = cfg.get("cleanup_interval_minutes", DEFAULT_CLEANUP_INTERVAL_MINUTES)
+    if min(s.timestamp_ms for s in expiring) > cutoff_ms - int(interval * 60 * 1000):
+        return 0, 0
     expiring_ids = {s.snapshot_id for s in expiring}
     kept = [s for s in tbl.metadata.snapshots if s.snapshot_id not in expiring_ids]
 
+    workers = cfg.get("relabel_workers", DEFAULT_RELABEL_WORKERS)
+    pool = _relabel_pool(workers)
+
     def files_of(snaps) -> set:
-        manifests = {m.manifest_path: m for s in snaps for m in s.manifests(tbl.io)}
-        return {
-            e.data_file.file_path
-            for m in manifests.values()
-            for e in m.fetch_manifest_entry(tbl.io, discard_deleted=True)
-        }
+        # Manifest lists and manifests read in parallel; manifests shared by
+        # many snapshots (most of them) are read once.
+        manifests = {}
+        for ms in pool.map(lambda snap: snap.manifests(tbl.io), snaps):
+            for m in ms:
+                manifests.setdefault(m.manifest_path, m)
+        out = set()
+        for entries in pool.map(lambda m: m.fetch_manifest_entry(tbl.io, discard_deleted=True), manifests.values()):
+            out.update(e.data_file.file_path for e in entries)
+        return out
 
     location = tbl.metadata.location.rstrip("/") + "/"
     doomed = sorted(p for p in files_of(expiring) - files_of(kept) if p.startswith(location))
@@ -1147,12 +1165,8 @@ def cleanup_target(cat, target_id: str, cfg: dict) -> tuple:
     es._snapshot_ids_to_expire = set()
     es.by_ids(sorted(expiring_ids)).commit()
 
-    def _delete(path):
-        tbl.io.delete(path)
-
-    workers = cfg.get("relabel_workers", DEFAULT_RELABEL_WORKERS)
     if doomed:
-        list(_relabel_pool(workers).map(_delete, doomed))
+        list(pool.map(tbl.io.delete, doomed))
     return len(expiring_ids), len(doomed)
 
 

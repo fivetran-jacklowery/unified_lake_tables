@@ -80,6 +80,9 @@ relabel_commit_batch: 500
 # longer than your slowest reader's refresh interval (Snowflake catalog
 # integrations: REFRESH_INTERVAL_SECONDS). 0 = off.
 cleanup_grace_minutes: 1440
+# Run cleanup at most about this often per table. It reads every kept
+# snapshot's manifests, which is expensive with frequent event-driven runs.
+cleanup_interval_minutes: 60
 
 # --- Optional: self-contained target. Default false. ---
 #

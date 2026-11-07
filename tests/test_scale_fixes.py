@@ -360,7 +360,7 @@ def test_cleanup_deletes_retired_copies_but_never_source_files():
 
         _time.sleep(0.2)
         cat.load_table("src_a.items").delete("id = 5")
-        rc.run(_cfg(cleanup_grace_minutes=0.001), tables=["items"])  # ~60 ms grace
+        rc.run(_cfg(cleanup_grace_minutes=0.001, cleanup_interval_minutes=0), tables=["items"])  # ~60 ms grace
         assert not os.path.exists(_local(old_copy[0])), "retired relabeled copy was not deleted"
         assert os.path.exists(_local(old_spliced[0])), "cleanup deleted a SOURCE file"
         tgt = cat.load_table("consolidated.items")
@@ -383,6 +383,27 @@ def test_cleanup_off_when_grace_is_zero():
         rc.run(_cfg(cleanup_grace_minutes=0), tables=["items"])
         assert rc.cleanup_target(cat, "consolidated.items", {"cleanup_grace_minutes": 0}) == (0, 0)
         assert len(cat.load_table("consolidated.items").metadata.snapshots) == 2
+    _with_catalog(body)
+
+
+
+def test_cleanup_is_throttled_to_its_interval():
+    import time as _time
+
+    def body(work):
+        cat = _setup(work)
+        rc.get_catalog = lambda: cat
+        rc.thread_catalog = lambda: cat
+        rc.run(_cfg(), tables=["items"])
+        cat.load_table("src_b.items").delete("id < 2")
+        rc.run(_cfg(), tables=["items"])
+        _time.sleep(0.2)
+        # Past the grace window, but not yet a full interval past it: skip.
+        cfg = {"cleanup_grace_minutes": 0.001, "cleanup_interval_minutes": 60, "relabel_workers": 2}
+        assert rc.cleanup_target(cat, "consolidated.items", cfg) == (0, 0)
+        cfg["cleanup_interval_minutes"] = 0
+        expired, deleted = rc.cleanup_target(cat, "consolidated.items", cfg)
+        assert expired >= 1 and deleted == 1, (expired, deleted)
     _with_catalog(body)
 
 
