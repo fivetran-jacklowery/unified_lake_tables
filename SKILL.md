@@ -93,7 +93,18 @@ This invariant currently holds by construction: across
 `register_consolidation.py`, `verify_consolidation.py`, `bench_vs_union.py`
 and `generate_delta_log.py`, every mutating call's receiver is `target_table`
 (or a transaction on it), and source handles only ever receive `.scan()`,
-`.schema()` and `.io`. The `examples/` entry points are thin adapters that
+`.schema()` and `.io`.
+
+**The one exception, and it is not yours to use.**
+`scripts/realign_source_field_ids.py` is an EXPERIMENTAL, human-run tool
+that drops and re-creates a source table to fix its field-id layout. It
+exists in the repo so a customer can choose to try it, in dev, knowingly. It
+does not relax anything above for you: you may run its read-only `plan` and
+show the result, and you may *propose* realigning a source, but **never run
+`apply`, `rollback` or `finalize`**, never pass its acknowledgement flag, and
+never pause or resume a connector for it. Those are the customer's
+decisions to make and actions to take. The four scripts named above stay
+read-only against sources; re-check that property if you change them. The `examples/` entry points are thin adapters that
 hold no consolidation logic of their own, so re-checking the four scripts
 above covers every backend. **If you change this code, preserve that
 property** —

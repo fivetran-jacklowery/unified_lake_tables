@@ -210,6 +210,24 @@ def test_finalize_deletes_originals_and_table_still_reads():
     _with_catalog(body)
 
 
+def test_finalize_refuses_while_the_target_still_splices_the_originals():
+    def body(work):
+        cat = _ready(work)
+        # src_a agrees with the target, so the target splices its files by
+        # reference. Realign it against a DIFFERENT layout (src_b's) so it has
+        # work to do, then try to finalize before re-consolidating.
+        ref = rs.reference_schema(cat, CFG, "items", reference_namespace="src_b")
+        p = rs.plan_one(cat, CFG, "src_a", "items", ref)
+        record = rs.apply_one(cat, CFG, p, "items", os.path.join(work, "records"))
+        try:
+            rs.finalize(cat, record)
+            raise AssertionError("finalize deleted files the consolidated target still references")
+        except rs.Refused as e:
+            assert "consolidated target" in str(e), e
+        _assert_matches(cat, cat.load_table("consolidated.items"))  # target still reads
+    _with_catalog(body)
+
+
 def test_refuses_a_column_the_reference_does_not_have():
     def body(work):
         cat = _ready(work)

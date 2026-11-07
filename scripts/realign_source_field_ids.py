@@ -69,7 +69,8 @@ WHAT IT DOES, PER SOURCE TABLE
          BEFORE the connector writes to the re-created table; refuses if it
          has, unless --force.
   finalize --record FILE -- deletes the original files. After this there is
-         no rollback.
+         no rollback. Refuses while the consolidated target still references
+         any of them (run register_consolidation.py first).
 
 BEFORE YOU RUN IT
 -----------------
@@ -331,6 +332,9 @@ def apply_one(cat, cfg: dict, p: dict, table: str, record_dir: str) -> str:
         "original_snapshot_id": p["snapshot_id"],
         "id_map": {str(k): v for k, v in p["id_map"].items()},
         "original_files": [df.file_path for df in p["files"]],
+        # finalize checks this table before deleting originals: a target that
+        # splices them by reference would break if they were deleted.
+        "consolidated_target": f"{cfg['target_namespace']}.{table}" if cfg.get("target_namespace") else None,
         "status": "started",
     }
     os.makedirs(record_dir, exist_ok=True)
@@ -430,6 +434,16 @@ def finalize(cat, record_path: str) -> None:
     still_used = [p for p in record["original_files"] if p in live]
     if still_used:
         raise Refused(f"{len(still_used)} original file(s) are still referenced by the table; not deleting")
+    target_id = record.get("consolidated_target")
+    if target_id and cat.table_exists(target_id):
+        tgt = cat.load_table(target_id)
+        referenced = {task.file.file_path for task in tgt.scan().plan_files()} if tgt.current_snapshot() else set()
+        in_target = [p for p in record["original_files"] if p in referenced]
+        if in_target:
+            raise Refused(
+                f"{len(in_target)} original file(s) are still referenced by the consolidated target "
+                f"{target_id}; deleting them would break it. Run register_consolidation.py first."
+            )
     for path in record["original_files"]:
         t.io.delete(path)
     record["status"] = "finalized: originals deleted, no rollback possible"
