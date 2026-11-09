@@ -15,4 +15,4 @@ boto3==1.43.66
 
 PyYAML==6.0.3
 
-python-dotenv==1.0.1
+python-dotenv==1.2.2
