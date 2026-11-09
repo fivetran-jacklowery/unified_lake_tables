@@ -165,6 +165,70 @@ Full technical walkthrough, including the exact private pyiceberg mechanism
 this depends on and why it took three attempts to get right: see
 [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md).
 
+## Performance and tuning
+
+What a run costs, and which setting moves it. All settings live in
+`config.yaml` (or the matching Lambda environment variable); defaults shown.
+
+| Setting | Default | Controls |
+|---|---|---|
+| `table_workers` | 8 | Consolidated tables processed at once. Governs metadata work and keeps the copy pool fed; it no longer controls copy throughput. |
+| `source_workers` | 8 | Per table, sources whose metadata is loaded and planned at once. |
+| `relabel_workers` | 32 | Relabel copies in flight, **shared by all tables** in the run. |
+| `relabel_commit_batch` | 500 | Add-only relabels commit every N files, so a crash or timeout loses one batch. |
+| `cleanup_grace_minutes` / `cleanup_interval_minutes` | 1440 / 60 | Snapshot expiry and deletion of retired copies, at most about once per interval per table. |
+
+**Where the time goes.**
+
+* **Relabel copies.** About 1.5 s each regardless of file size (footer read,
+  multipart create, server-side part copy, footer upload, complete), so a
+  table's copy time is roughly *files / `relabel_workers`*. On Glue the data
+  never passes through the process: at 32 workers and ~32 MB files that is
+  ~40 GB/min.
+* **Metadata.** Every source of every table is loaded (one catalog call plus
+  its metadata file) and, if it changed, planned (its manifests). That is a
+  few hundred requests per table at a few hundred sources, whether or not
+  anything is copied.
+* **The largest table sets the floor.** One table is never split across
+  workers or processes, so no setting gets you below its file count divided
+  by `relabel_workers`.
+
+**Raising `table_workers`.** Safe for correctness: tables are independent
+Iceberg tables with independent commits, and each worker has its own catalog
+connection. The limits are throughput, in the order you will hit them:
+
+1. **Catalog API rate limits.** Metadata requests in flight are about
+   `table_workers x source_workers`. AWS Glue throttles per account (see your
+   Service Quotas; other workloads share them) and shows it as
+   `ThrottlingException`; a table that exhausts retries fails, and rerunning
+   is safe but slower than not throttling.
+2. **CPU.** Decoding manifests is Python CPU work under the GIL, so threads
+   stop helping at a small multiple of the core count (a Lambda has up to
+   6 vCPUs at 10 GB).
+3. S3 and commits are not limits at these levels.
+
+Reasonable starting points: on a container or laptop for an initial load, try
+`table_workers: 16` with `relabel_workers: 64`, keep
+`table_workers x source_workers` around 100-200 until you know your catalog's
+limits, and back off if you see throttling or pinned CPU. In a Lambda, about 16.
+
+**Running several processes at once.** Splitting the tables across processes
+or Lambdas (CLI: table names as arguments; Lambda: `{"tables": [...]}`) gets
+past the GIL and speeds up runs over many tables. One rule: **no two runs may
+process the same table at the same time.** It stays correct -- Iceberg's
+commit check makes the second commit fail instead of duplicating -- but the
+copying is wasted and the run must be retried. Put the largest tables in their
+own process; spread the rest by size, not alphabetically.
+
+**Steady state: what actually makes refreshes fast.** A source whose snapshot
+is unchanged since the last run is not planned, and a table with no changed
+source does almost nothing -- but every run still loads every source to find
+that out. For event-driven runs, pass the source(s) the event is about:
+`--sources tenant_a` (CLI) or `{"tables": ["orders"], "sources": ["tenant_a"]}`
+(Lambda). Then a run costs what changed, not how many tenants exist. Without
+it, hundreds of runs per minute each loading every source will hit catalog
+rate limits.
+
 ## When sources disagree about field ids
 
 Fivetran assigns field ids in column order when it creates a table, and it
