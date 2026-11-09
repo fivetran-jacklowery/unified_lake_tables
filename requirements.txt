@@ -18,4 +18,4 @@ PyYAML==6.0.3
 
 # Loads .env into the process environment so the scripts pick up Polaris
 # OAuth credentials without requiring the customer to `export` them by hand.
-python-dotenv==1.0.1
+python-dotenv==1.2.2
